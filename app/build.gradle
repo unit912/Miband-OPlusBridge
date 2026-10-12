@@ -11,11 +11,11 @@ android {
         applicationId 'io.github.miam1ku.mibandoplusbridge'
         // 目标机是一加 Ace 5 Pro / ColorOS 15（API 35）。minSdk 高于系统版本时
         // adb install 会被 INSTALL_FAILED_OLDER_SDK 直接拒掉，且 LSPosed 作用域里
-        // 也可能不显示，所以按系统等级对齐到 35。
+        // 也可能不显示，所以按系统等级对齐到 35（上游 1.7.8 升到 36，这里不跟）。
         minSdk 35
         targetSdk 35
-        versionCode 90
-        versionName '1.7.7'
+        versionCode 91
+        versionName '1.7.8'
         // LSPosed auto hot reload only fires when the installed versionCode changes.
         // For a dev loop: ./gradlew :app:assembleDebug -PhotReloadVersionCode=<higher number>
         if (project.hasProperty('hotReloadVersionCode')) {
