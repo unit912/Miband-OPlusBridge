@@ -5,6 +5,7 @@ import io.github.miam1ku.mibandoplusbridge.hook.xposed.HookRuntime;
 import android.content.Context;
 import android.content.Intent;
 import android.database.ContentObserver;
+import android.database.Cursor;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Looper;
@@ -243,6 +244,7 @@ public final class OHealthDeviceHook {
                 for (Object controller : liveControllers()) {
                     project(controller, loader, previous, true);
                 }
+                worker.post(() -> publishHealthCardRow(result));
                 worker.post(() -> dropDuplicateSpaceCard(loader));
             });
             // The first provider call often races process start. A miss used to leave the device tab empty.
@@ -283,8 +285,105 @@ public final class OHealthDeviceHook {
         });
     }
 
-    private static Bundle fromProvider() {
+    /**
+     * 健康卡行发布器（2026-10-18）：健康 WatchProvider 的卡片表
+     * （device_info_v2.db / device_info_table_new）被 DeviceIdleDisableWork
+     * 在每次健康进程启动时清空禁用后，宿主自己不再重发——设备空间/负一屏
+     * 的手表卡从此消失。设备空间 UI 只认 health authority 的行
+     * （桥接 DEVICE_APP 源的行会被 UI 过滤，实测 DevicesManager 收到也不渲染），
+     * 所以桥接直接把实时快照 upsert 进健康表：电量/连接状态随 band-state
+     * 刷新（60s 周期 + provider 变更触发），并保活 WatchProvider 组件。
+     *
+     * <p>mydevices 侧（MyDevicesHook.ObserverSession）发现该行存在时按健康卡
+     * id（MAC 的 MD5）调 onDeviceAdd，宿主按内置 authority 映射查健康
+     * provider 建卡 —— 与 10-17 前的正常链路一致。
+     */
+    private static void publishHealthCardRow(Bundle shown) {
+        if (shown == null || !shown.getBoolean("registered", false)) return;
+        String mac = shown.getString("mac", "");
+        if (mac == null || mac.isBlank()) return;
         try {
+            String id = md5Lowercase(mac);
+            long now = System.currentTimeMillis();
+            int battery = shown.getInt("battery", -1);
+            boolean charging = shown.getBoolean("charging", false);
+            org.json.JSONArray batteries = new org.json.JSONArray();
+            org.json.JSONArray levels = new org.json.JSONArray();
+            if (battery >= 0 && battery <= 100) {
+                batteries.put(new org.json.JSONObject()
+                        .put("batteryType", "SINGLE")
+                        .put("value", battery)
+                        .put("charge", charging));
+                levels.put(battery);
+            }
+            String data = new org.json.JSONObject()
+                    .put("mDeviceId", id)
+                    .put("mDeviceName", shown.getString("name", "HUAWEI WATCH GT3"))
+                    .put("mMacAddress", mac)
+                    .put("modelId", shown.getString("modelId", ""))
+                    .put("mDeviceType", "WATCH")
+                    .put("iconUrl", "default_watch")
+                    .put("mIconUrl", "default_watch")
+                    .put("mBatteryInfoList", batteries)
+                    .put("mBatteryList", levels)
+                    .put("connection", new org.json.JSONObject()
+                            .put("connectState", shown.getBoolean("connected")
+                                    ? "CONNECTED" : "DISCONNECTED")
+                            .put("coordinationState", "DEFAULT")
+                            .put("lastConnectTime", now)
+                            .put("lastDisconnectTime", 0))
+                    .put("mConnectState", shown.getBoolean("connected")
+                            ? "CONNECTED" : "DISCONNECTED")
+                    .put("mAuthority", "com.heytap.health.WatchProvider")
+                    .put("isActive", shown.getBoolean("connected"))
+                    .put("cardStyle", 1)
+                    .put("timestamp", now)
+                    .put("versionCode", 1L)
+                    .put("feature", 0)
+                    .put("linkageVersion", 0)
+                    .put("autoSwitch", false)
+                    .put("revision", shown.getLong("revision", 0))
+                    .toString();
+            android.database.sqlite.SQLiteDatabase db =
+                    android.database.sqlite.SQLiteDatabase.openOrCreateDatabase(
+                            hostContext.getDatabasePath("device_info_v2.db"), null);
+            try {
+                db.execSQL("CREATE TABLE IF NOT EXISTS device_info_table_new ("
+                        + "_id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                        + "device_id TEXT, device_mac TEXT, authority TEXT, device_data TEXT)");
+                db.execSQL("DELETE FROM device_info_table_new WHERE device_mac=?",
+                        new Object[]{mac});
+                db.execSQL("INSERT INTO device_info_table_new "
+                        + "(device_id, device_mac, authority, device_data) VALUES (?,?,?,?)",
+                        new Object[]{id, mac, "com.heytap.health.WatchProvider", data});
+            } finally {
+                db.close();
+            }
+            // 保活：DeviceIdleDisableWork 禁用组件会让 mydevices 查询失败。
+            hostContext.getPackageManager().setComponentEnabledSetting(
+                    new android.content.ComponentName(hostContext,
+                            "com.heytap.health.linkage.watch.WatchProvider"),
+                    android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
+                    android.content.pm.PackageManager.DONT_KILL_APP);
+        } catch (Throwable failure) {
+            HookRuntime.log("HEALTH_CARD_PUBLISH_FAILED "
+                    + failure.getClass().getSimpleName());
+        }
+    }
+
+    private static String md5Lowercase(String text) {
+        try {
+            byte[] digest = java.security.MessageDigest.getInstance("MD5")
+                    .digest(text.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            StringBuilder hex = new StringBuilder(32);
+            for (byte b : digest) hex.append(String.format("%02x", b));
+            return hex.toString();
+        } catch (java.security.NoSuchAlgorithmException impossible) {
+            return text;
+        }
+    }
+
+    private static Bundle fromProvider() {        try {
             Bundle result = hostContext.getContentResolver().call(DeviceCardProvider.URI, "bandDisplay", null, null);
             // A missing or malformed IPC snapshot stays unknown. Removal waits for an explicit clear.
             if (result == null || !(result.get("registered") instanceof Boolean)) return null;
@@ -1071,26 +1170,58 @@ public final class OHealthDeviceHook {
      * {@code DMLocalDeviceManager.INSTANCE.getUserBoundDeviceListByMac(mac)} 与 rememberBand 的
      * {@code saveUserBoundDevice} 是同一个库，同步可读；用户在健康 App 里解绑会同步消失，
      * 两个方向都正确。健康 App 自己查找失配时会打 {@code DMLocalDeviceManager: getUserBoundDeviceListByMac not find}。
+     *
+     * <p>★ 2026-10-18 补充：绑定库有条目 ≠ 卡片真的发布过。健康 App 的
+     * DeviceIdleDisableWork 会在启动时禁用 WatchProvider 并清空 device_info_v2.db
+     * （实测整表 0 行），此后若没有新的发布事件，mydevices 永远查不到健康卡 ——
+     * 而按旧判定 yield=true，桥接卡又让了位，设备空间/负一屏只剩 mydevices 的
+     * 陈旧缓存：连接状态还在、电量因过期被隐藏（用户看到的「卡片不显电量」）。
+     * 所以绑定库命中后必须再验一次 WatchProvider 表里真有这台表的行；
+     * 验证失败（表空/组件被禁/query 抛异常）一律按「健康卡不存在」处理，
+     * 让带实时电量的桥接卡顶上。
      */
     private static volatile Boolean boundSeen;
 
     private static boolean healthCardPresent(ClassLoader loader, String mac) {
+        boolean bound;
         try {
             Class<?> local = XposedHelpers.findClass(
                     "com.heytap.health.devicemanagerimpl.processor.DMLocalDeviceManager", loader);
             Object instance = local.getField("INSTANCE").get(null);
-            Object bound = local.getMethod("getUserBoundDeviceListByMac", String.class)
+            Object list = local.getMethod("getUserBoundDeviceListByMac", String.class)
                     .invoke(instance, mac);
+            bound = list != null;
             // 只在翻转时记一行：绑定库增删这台表（用户在健康 App 里绑定/解绑）会改变
             // yield 方向，是排障时最想看到的信号；常态静默避免每轮刷新都刷屏。
-            if (boundSeen == null || boundSeen != (bound != null)) {
-                boundSeen = bound != null;
+            if (boundSeen == null || boundSeen != bound) {
+                boundSeen = bound;
                 HookRuntime.log("DEVICE_SPACE_BOUND mac=" + mac + " found=" + boundSeen);
             }
-            return bound != null;
         } catch (Throwable failure) {
             HookRuntime.log("DEVICE_SPACE_BOUND_UNAVAILABLE "
                     + failure.getClass().getSimpleName());
+            return false;
+        }
+        if (!bound) return false;
+        // 第二道：绑定库有，但 WatchProvider 卡片表里必须真有这台表的行，
+        // yield 才算成立（详见方法注释的 2026-10-18 补充）。
+        return watchProviderRowPresent(mac);
+    }
+
+    /** 健康 WatchProvider 的卡片表里有这台表的行（含连接状态的新鲜数据）才 true。 */
+    private static boolean watchProviderRowPresent(String mac) {
+        try (Cursor cursor = hostContext.getContentResolver().query(
+                android.net.Uri.parse(
+                        "content://com.heytap.health.WatchProvider/device_info_table_new"),
+                new String[]{"device_mac"}, null, null, null)) {
+            if (cursor == null) return false;
+            while (cursor.moveToNext()) {
+                if (io.github.miam1ku.mibandoplusbridge.data.MacIds.same(
+                        mac, cursor.getString(0))) return true;
+            }
+            return false;
+        } catch (Throwable unavailable) {
+            // 组件被 DeviceIdleDisableWork 禁用/表损坏：健康卡此时必然不可见。
             return false;
         }
     }
