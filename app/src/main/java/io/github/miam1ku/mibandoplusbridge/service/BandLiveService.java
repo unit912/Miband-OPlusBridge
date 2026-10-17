@@ -75,6 +75,8 @@ public final class BandLiveService extends Service {
     private volatile long sleepPulledOkAtMs;
     private static final long SLEEP_STUCK_MS = 90_000L;
     private static final long SLEEP_REPULL_MS = 15 * 60_000L;
+    /** 周期路径（非握手串行链）调用 maybePullSleep 时的空推进：链早就走完了。 */
+    private static final Runnable NO_ADVANCE = () -> { };
     private static final java.util.concurrent.atomic.AtomicLong SESSION_IDS = new java.util.concurrent.atomic.AtomicLong();
     private io.github.miam1ku.mibandoplusbridge.notify.PhoneCallMonitor calls;
     private static final String HEALTH_PACKAGE = "com.heytap.health";
@@ -1195,7 +1197,8 @@ public final class BandLiveService extends Service {
      * 认证后数据拉取的串行驱动。
      *
      * <p>stage 顺序：0 初始步数（通道验证）→ 1 当日汇总 → 2 心率 → 3 步数
-     * 历史（24h 全量分钟明细）→ 4 通知约束（0x02）→ 5 睡眠。每段的终态
+     * 历史（24h 全量分钟明细）→ 4 通知约束（0x02）→ 5 睡眠 → 6 表盘列表
+     * （0x27）。每段的终态
      * 回调（成功<b>和</b>失败）都推进到下一段 —— 单段失败不拖死后面，各段
      * 数据彼此独立。
      *
@@ -1314,12 +1317,71 @@ public final class BandLiveService extends Service {
             }
             case 5: {
                 // 睡眠：24h 窗口，挂在步数历史链全部到齐之后 —— 通道此刻空闲。
-                maybePullSleep(provider, finalized, epoch);
+                maybePullSleep(provider, finalized, epoch, advance);
+                return;
+            }
+            case 6: {
+                // 表盘列表（0x27）：设备页表盘区与桥接表盘管理的数据源。
+                // 低优先级，失败静默推进。
+                provider.readWatchfaces(new io.github.miam1ku.mibandoplusbridge
+                        .protocol.huawei.requests.GetWatchfacesListRequest
+                        .WatchfaceListener() {
+                    @Override
+                    public void onWatchfaces(java.util.List<io.github.miam1ku
+                            .mibandoplusbridge.protocol.huawei.packets.Watchface
+                            .InstalledWatchfaceInfo> watchfaces,
+                            java.util.HashMap<String, String> names) {
+                        if (finalized.get() || epoch != sessionEpoch) return;
+                        io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(
+                                BandLiveService.this, "HUAWEI_WATCHFACES count="
+                                        + watchfaces.size());
+                        io.github.miam1ku.mibandoplusbridge.data.HuaweiDeviceRegistry
+                                .noteWatchfaces(BandLiveService.this,
+                                        serializeWatchfaces(watchfaces, names));
+                        io.github.miam1ku.mibandoplusbridge.data.HuaweiDeviceRegistry
+                                .publish(BandLiveService.this);
+                        advance.run();
+                    }
+
+                    @Override
+                    public void onError(String message) {
+                        if (finalized.get() || epoch != sessionEpoch) return;
+                        io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(
+                                BandLiveService.this, "HUAWEI_WATCHFACES_FAILED " + message);
+                        advance.run();
+                    }
+                });
                 return;
             }
             default:
-                // 6 = 链走完，无事可做。
+                // 7 = 链走完，无事可做。
         }
+    }
+
+    /** 表盘列表 → JSON 数组字符串（name/version/current/factory/display）。 */
+    private static String serializeWatchfaces(java.util.List<io.github.miam1ku
+            .mibandoplusbridge.protocol.huawei.packets.Watchface
+            .InstalledWatchfaceInfo> watchfaces,
+            java.util.HashMap<String, String> names) {
+        org.json.JSONArray array = new org.json.JSONArray();
+        for (io.github.miam1ku.mibandoplusbridge.protocol.huawei.packets.Watchface
+                .InstalledWatchfaceInfo info : watchfaces) {
+            if (info == null || info.fileName == null || info.fileName.isBlank()) continue;
+            try {
+                String display = names == null ? null : names.get(info.fileName);
+                array.put(new org.json.JSONObject()
+                        .put("name", info.fileName)
+                        .put("version", info.version == null ? "" : info.version)
+                        .put("current", info.isCurrent())
+                        .put("factory", info.isFactory())
+                        .put("editable", info.isEditable())
+                        .put("display", display == null || display.isBlank()
+                                ? info.fileName : display));
+            } catch (org.json.JSONException ignored) {
+                // 单条序列化失败跳过，不影响其余表盘。
+            }
+        }
+        return array.toString();
     }
 
     /**
@@ -1395,11 +1457,21 @@ public final class BandLiveService extends Service {
      * {@link #clearStuckSleepPull(HuaweiSupportProvider)} 周期复位。
      */
     private void maybePullSleep(final HuaweiSupportProvider provider,
-            final AtomicBoolean finalized, final long epoch) {
+            final AtomicBoolean finalized, final long epoch, final Runnable advance) {
         if (finalized.get() || epoch != sessionEpoch) return;
         long now = System.currentTimeMillis();
-        if (sleepPulledOkAtMs > 0 && now - sleepPulledOkAtMs < SLEEP_REPULL_MS) return;
-        if (!sleepPullBusy.compareAndSet(false, true)) return;
+        if (sleepPulledOkAtMs > 0 && now - sleepPulledOkAtMs < SLEEP_REPULL_MS) {
+            // 本会话已拉过睡眠且在抑制窗内：跳过拉取，但链还要继续走
+            // （表盘等后续阶段不能因睡眠被抑制而饿死）。
+            advance.run();
+            return;
+        }
+        if (!sleepPullBusy.compareAndSet(false, true)) {
+            // 上一轮睡眠链还在飞：不重复拉，但同样要把链放过去 ——
+            // 并发同通道链会无声挂死，宁可让后续阶段在通道忙时排队。
+            advance.run();
+            return;
+        }
         final long gen = ++sleepPullGen;
         sleepPullSinceMs = now;
         io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this,
@@ -1413,7 +1485,7 @@ public final class BandLiveService extends Service {
                     sleepPulledOkAtMs = System.currentTimeMillis();
                 }
                 if (finalized.get() || epoch != sessionEpoch) return;
-                handleSleepOnce(finalized, epoch, total, segments);
+                handleSleepOnce(finalized, epoch, total, segments, advance);
             }
 
             @Override
@@ -1422,6 +1494,7 @@ public final class BandLiveService extends Service {
                 if (finalized.get() || epoch != sessionEpoch) return;
                 io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(BandLiveService.this,
                         "HUAWEI_SLEEP_FAILED gen=" + gen + " " + message);
+                advance.run();
             }
         });
     }
@@ -1456,7 +1529,8 @@ public final class BandLiveService extends Service {
     private void handleSleepOnce(java.util.concurrent.atomic.AtomicBoolean finalized, long epoch,
             int total,
             java.util.List<io.github.miam1ku.mibandoplusbridge.protocol.huawei.packets
-                    .FitnessData.MessageData.SleepResponse.SubContainer> segments) {
+                    .FitnessData.MessageData.SleepResponse.SubContainer> segments,
+            Runnable advance) {
         BandLiveService service = BandLiveService.this;
         java.util.List<io.github.miam1ku.mibandoplusbridge.protocol.huawei.packets
                 .FitnessData.MessageData.SleepResponse.SubContainer> copy =
@@ -1500,6 +1574,10 @@ public final class BandLiveService extends Service {
             if (HuaweiDeviceRegistry.noteSleep(service, lastStart, lastEnd)) {
                 HuaweiDeviceRegistry.publish(service);
             }
+            // ★ 睡眠本来是握手串行链的最后一段，写库在后台线程里收尾 ——
+            // 没有这一句，后加的表盘阶段（stage 6）永远拿不到执行机会
+            // （2026-10-18 v96 实机：睡眠导完链就停了）。
+            advance.run();
         }, "HuaweiSleepImport").start();
     }
 
@@ -1677,7 +1755,8 @@ public final class BandLiveService extends Service {
                             refreshHuaweiBattery(provider, finalized, epoch);
                             // 心率链已收尾、通道空闲：补一次睡眠拉取（带
                             // 15 分钟新鲜度门槛与在飞互斥，非每次都真发）。
-                            maybePullSleep(provider, finalized, epoch);
+                            // 周期路径不走握手阶段机，advance 是空跑。
+                            maybePullSleep(provider, finalized, epoch, NO_ADVANCE);
                         }
 
                         @Override
@@ -1686,7 +1765,7 @@ public final class BandLiveService extends Service {
                             io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(
                                     BandLiveService.this, "HUAWEI_HR_FAILED " + message);
                             refreshHuaweiBattery(provider, finalized, epoch);
-                            maybePullSleep(provider, finalized, epoch);
+                            maybePullSleep(provider, finalized, epoch, NO_ADVANCE);
                         }
                     });
                 }

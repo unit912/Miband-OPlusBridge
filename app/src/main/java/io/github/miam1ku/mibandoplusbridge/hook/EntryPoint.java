@@ -304,6 +304,12 @@ public final class EntryPoint extends XposedModule {
             probe("OHEALTH_NOTIFICATION_ACCESS_HOOK_UNAVAILABLE");
         }
         try {
+            OHealthWatchfaceHook.install(context, loader);
+            probe("OHEALTH_WATCHFACE_HOOK_INSTALLED");
+        } catch (Throwable incompatible) {
+            probe("OHEALTH_WATCHFACE_HOOK_UNAVAILABLE");
+        }
+        try {
             OHealthDndHook.install(context);
             probe("OHEALTH_DND_HOOK_INSTALLED");
         } catch (Throwable incompatible) {

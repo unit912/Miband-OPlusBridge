@@ -255,6 +255,37 @@ public final class DeviceCardProvider extends ContentProvider {
         display.putLong("stepsAtMs", state.getLong("stepsAtMs", 0));
         display.putLong("lastUpdateMs", state.getLong("lastUpdateMs", 0));
         display.putLong("revision", state.getLong("revision", 0));
+        // 表盘列表（Watchface 0x27）：宿主设备页表盘区与桥接表盘管理的数据源。
+        display.putString("watchfaces", state.getString("watchfaces", ""));
+        display.putLong("watchfacesAtMs", state.getLong("watchfacesAtMs", 0));
         return display;
+    }
+
+    /**
+     * 表盘预览 PNG：{@code content://<authority>/watchface_preview}。
+     *
+     * <p>宿主进程的 {@code OHealthWatchfaceHook} 换设备页顶部静态图时
+     * 从这里读图。文件缺失（桥接刚装、还没 publish 过）时同步现画一张，
+     * 保证首次打开设备页就有图。
+     */
+    @Override
+    public android.os.ParcelFileDescriptor openFile(Uri uri, String mode) {
+        requireReader();
+        if (!"watchface_preview".equals(uri.getLastPathSegment())) {
+            throw new IllegalArgumentException("UNSUPPORTED_FILE_URI " + uri);
+        }
+        if (!"r".equals(mode)) throw new IllegalArgumentException("READ_ONLY");
+        java.io.File png = io.github.miam1ku.mibandoplusbridge.data
+                .WatchfacePreviewRenderer.file(getContext());
+        if (!png.isFile() || png.length() == 0) {
+            io.github.miam1ku.mibandoplusbridge.data.WatchfacePreviewRenderer
+                    .render(getContext());
+        }
+        try {
+            return android.os.ParcelFileDescriptor.open(png,
+                    android.os.ParcelFileDescriptor.MODE_READ_ONLY);
+        } catch (java.io.FileNotFoundException e) {
+            throw new IllegalStateException("WATCHFACE_PREVIEW_MISSING", e);
+        }
     }
 }

@@ -84,6 +84,8 @@ android {
             // 两者都在排除清单里，导入器本身也必须排除，否则 probe 编译找不到符号。
             java.exclude 'io/github/miam1ku/mibandoplusbridge/data/HuaweiSleepImporter.java'
             java.exclude 'io/github/miam1ku/mibandoplusbridge/data/HuaweiStepsImporter.java'
+            // 表盘预览合成器引用 HuaweiDeviceRegistry（已排除），同步排除。
+            java.exclude 'io/github/miam1ku/mibandoplusbridge/data/WatchfacePreviewRenderer.java'
             java.exclude 'io/github/miam1ku/mibandoplusbridge/data/ImportWindow.java'
             java.exclude 'io/github/miam1ku/mibandoplusbridge/data/LegacyPrefsMigration.java'
             java.exclude 'io/github/miam1ku/mibandoplusbridge/data/LocalPrefs.java'

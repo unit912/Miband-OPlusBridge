@@ -41,6 +41,8 @@ public final class HuaweiDeviceRegistry {
     private static final String KEY_SLEEP_START = "lastSleepStartMs";
     private static final String KEY_SLEEP_END = "lastSleepEndMs";
     private static final String KEY_SLEEP_AT = "lastSleepAt";
+    private static final String KEY_WATCHFACES = "watchfaces";
+    private static final String KEY_WATCHFACES_AT = "watchfacesAt";
 
     private HuaweiDeviceRegistry() {}
 
@@ -214,6 +216,30 @@ public final class HuaweiDeviceRegistry {
                 .commit();
     }
 
+    /**
+     * 记下已安装表盘列表（Watchface 0x27 的 0x02+0x06 两阶段结果）。
+     *
+     * <p>JSON 数组，每项 {@code {"name":..,"version":..,"current":bool,"factory":bool}}。
+     * 宿主设备页的表盘区、桥接自己的表盘管理都读这份数据。
+     */
+    public static boolean noteWatchfaces(Context context, String json) {
+        if (json == null || json.isBlank()) return false;
+        return LocalPrefs.open(context, NAME).edit()
+                .putString(KEY_WATCHFACES, json)
+                .putLong(KEY_WATCHFACES_AT, System.currentTimeMillis())
+                .commit();
+    }
+
+    /** 已安装表盘列表 JSON；从未拉到为空串。 */
+    public static String watchfaces(Context context) {
+        return LocalPrefs.open(context, NAME).getString(KEY_WATCHFACES, "");
+    }
+
+    /** 最近一次表盘列表拉取的时间（epoch millis）；从未拉到为 0。 */
+    public static long watchfacesAt(Context context) {
+        return LocalPrefs.open(context, NAME).getLong(KEY_WATCHFACES_AT, 0L);
+    }
+
     // ------------------------------------------------------- 投影到 OPPO 侧
     //
     // 钩子层（OHealthDeviceHook / MyDevicesHook / OHealthStepWriter）只有
@@ -283,6 +309,12 @@ public final class HuaweiDeviceRegistry {
             if (hr > 0 && hrAt > 0) {
                 edit.putInt("heartRate", hr).putLong("heartRateAtMs", hrAt);
             }
+            // 表盘列表：宿主设备页的表盘区与桥接的表盘管理都从 band-state 读。
+            String watchfaces = watchfaces(context);
+            if (!watchfaces.isBlank()) {
+                edit.putString("watchfaces", watchfaces)
+                        .putLong("watchfacesAtMs", watchfacesAt(context));
+            }
             if (state.getLong("registeredAtMs", 0) <= 0) {
                 long provisioned = provisionedAt(context);
                 edit.putLong("registeredAtMs", provisioned > 0 ? provisioned : now);
@@ -290,6 +322,9 @@ public final class HuaweiDeviceRegistry {
             edit.commit();
             context.getContentResolver().notifyChange(
                     io.github.miam1ku.mibandoplusbridge.integration.DeviceCardProvider.URI, null);
+            // 表盘预览跟着数据走（内部 30s 节流）：设备页顶部那块 W301CN
+            // 暗色静态图由 hook 层换成这张实时合成图。
+            WatchfacePreviewRenderer.renderAsync(context);
         } catch (RuntimeException ignored) {
             // 用户未解锁或存储不可用时静默跳过；下一次会话会再写一次。
         }

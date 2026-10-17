@@ -21,6 +21,7 @@ import io.github.miam1ku.mibandoplusbridge.protocol.huawei.requests.GetDeviceSta
 import io.github.miam1ku.mibandoplusbridge.protocol.huawei.requests.GetBatteryLevelRequest;
 import io.github.miam1ku.mibandoplusbridge.protocol.huawei.requests.GetExpandCapabilityRequest;
 import io.github.miam1ku.mibandoplusbridge.protocol.huawei.requests.GetFitnessDataRequest;
+import io.github.miam1ku.mibandoplusbridge.protocol.huawei.requests.GetWatchfacesListRequest;
 import io.github.miam1ku.mibandoplusbridge.protocol.huawei.requests.GetFitnessTotalsRequest;
 import io.github.miam1ku.mibandoplusbridge.protocol.huawei.requests.GetHiChainRequest;
 import io.github.miam1ku.mibandoplusbridge.protocol.huawei.requests.GetLinkParamsRequest;
@@ -295,6 +296,25 @@ public final class HuaweiSupportProvider implements HuaweiSocketCallback {
             req.doPerform();
         } catch (java.io.IOException e) {
             LOG.error("failed to request sleep data", e);
+            if (onDone != null) {
+                onDone.onError(e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * 拉已安装表盘列表+显示名（Watchface 0x27，两阶段）。
+     *
+     * <p>0x27 与 FitnessData 0x07 是不同服务，但同样必须串行 —— 表盘链问名单的
+     * 同时另开 0x07 链，实测会出现响应无人认领（分发按 service/command 匹配）。
+     */
+    public void readWatchfaces(
+            GetWatchfacesListRequest.WatchfaceListener onDone) {
+        GetWatchfacesListRequest req = new GetWatchfacesListRequest(this, onDone);
+        try {
+            req.doPerform();
+        } catch (java.io.IOException e) {
+            LOG.error("failed to request watchface list", e);
             if (onDone != null) {
                 onDone.onError(e.getMessage());
             }
