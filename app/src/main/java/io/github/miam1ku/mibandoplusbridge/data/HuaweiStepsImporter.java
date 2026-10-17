@@ -22,6 +22,11 @@ import io.github.miam1ku.mibandoplusbridge.protocol.huawei.packets.FitnessData;
  * 所以这里按分钟原样转写即可，宿主那边的 {@code stepDays} 聚合与表 1002 写入
  * 复用现成实现。
  *
+ * <p>血氧（{@code spo2}）也搭同一趟车：GT3 不提供单独的血氧历史命令，测量结果
+ * 以 featureBitmap2 bit 0x01 的形式挂在分钟子容器里（协议层已解析为
+ * {@code SubContainer.spo}，单字节 0..100）。单次测量是瞬时点，按 manual 模式
+ * 写入（区间长度 1ms，见 HealthRecord 的区间约束）。
+ *
  * <p>只写有内容的分钟：步数为 0 的一分钟写成 0 行或写成空，对当日总和、日聚合
  * 都没有区别，但能省下上千条记录。心率同理，只写 40..220 的合理值。
  */
@@ -33,7 +38,7 @@ public final class HuaweiStepsImporter {
     private HuaweiStepsImporter() {}
 
     /** 队列写入结果。 */
-    public record Result(int steps, int heart, int purged) {}
+    public record Result(int steps, int heart, int oxygen, int purged) {}
 
     /**
      * 转写一次拉取拿到的全部分钟样本。
@@ -49,8 +54,9 @@ public final class HuaweiStepsImporter {
             if (windowStartMs > 0 && windowEndMs > windowStartMs) {
                 purged += store.purgeWindow(deviceId, "steps_interval", windowStartMs, windowEndMs);
                 purged += store.purgeWindow(deviceId, "heart_rate", windowStartMs, windowEndMs);
+                purged += store.purgeWindow(deviceId, "spo2", windowStartMs, windowEndMs);
             }
-            return new Result(0, 0, purged);
+            return new Result(0, 0, 0, purged);
         }
         ZoneId resolved = zone == null ? ZoneId.systemDefault() : zone;
         HealthRecordStore store = new HealthRecordStore(context);
@@ -58,9 +64,11 @@ public final class HuaweiStepsImporter {
         if (windowStartMs > 0 && windowEndMs > windowStartMs) {
             purged += store.purgeWindow(deviceId, "steps_interval", windowStartMs, windowEndMs);
             purged += store.purgeWindow(deviceId, "heart_rate", windowStartMs, windowEndMs);
+            purged += store.purgeWindow(deviceId, "spo2", windowStartMs, windowEndMs);
         }
         int steps = 0;
         int heart = 0;
+        int oxygen = 0;
         long total = 0;
         for (FitnessData.MessageData.StepResponse.SubContainer sample : samples) {
             if (sample == null || sample.timestamp <= 0) continue;
@@ -73,7 +81,7 @@ public final class HuaweiStepsImporter {
                     steps++;
                     total += sample.steps;
                 } else {
-                    return new Result(steps, heart, purged);
+                    return new Result(steps, heart, oxygen, purged);
                 }
             }
             if (sample.heartrate >= 40 && sample.heartrate <= 220) {
@@ -81,13 +89,39 @@ public final class HuaweiStepsImporter {
                         sample.heartrate, resolved, null, null)) {
                     heart++;
                 } else {
-                    return new Result(steps, heart, purged);
+                    return new Result(steps, heart, oxygen, purged);
+                }
+            }
+            if (sample.spo >= 60 && sample.spo <= 100) {
+                if (writeManual(context, store, deviceId, "spo2", minute, sample.spo, resolved)) {
+                    oxygen++;
+                } else {
+                    return new Result(steps, heart, oxygen, purged);
                 }
             }
         }
         SessionLog.line(context, "HUAWEI_STEPS_IMPORT minutes=" + steps
-                + " steps=" + total + " heart=" + heart + " purged=" + purged);
-        return new Result(steps, heart, purged);
+                + " steps=" + total + " heart=" + heart + " oxygen=" + oxygen
+                + " purged=" + purged);
+        return new Result(steps, heart, oxygen, purged);
+    }
+
+    /** manual 模式的瞬时点写入：区间长度 1ms（HealthRecord 的区间约束）。 */
+    private static boolean writeManual(android.content.Context context, HealthRecordStore store,
+            String deviceId, String kind, long startMs, int value, ZoneId zone) {
+        try {
+            store.enqueueMeasurement(measurement(deviceId, kind, startMs, value, zone,
+                    null, null, startMs + 1L, "manual"));
+            return true;
+        } catch (IllegalStateException | SecurityException unavailable) {
+            // 账户没确认时写不进去，小米侧同样如此。
+            SessionLog.line(context, "HUAWEI_STEPS_QUEUE_UNAVAILABLE "
+                    + unavailable.getMessage());
+            return false;
+        } catch (RuntimeException refused) {
+            SessionLog.line(context, "HUAWEI_STEPS_QUEUE_REJECTED " + refused.getMessage());
+            return false;
+        }
     }
 
     private static boolean write(android.content.Context context, HealthRecordStore store,
@@ -95,7 +129,7 @@ public final class HuaweiStepsImporter {
             Integer calories, Integer distance) {
         try {
             store.enqueueMeasurement(measurement(deviceId, kind, startMs, value, zone,
-                    calories, distance));
+                    calories, distance, startMs + MINUTE_MS, "continuous"));
             return true;
         } catch (IllegalStateException | SecurityException unavailable) {
             // 账户没确认时写不进去，小米侧同样如此。
@@ -109,20 +143,21 @@ public final class HuaweiStepsImporter {
     }
 
     private static BandHistoryParser.Measurement measurement(String deviceId, String kind,
-            long startMs, int value, ZoneId zone, Integer calories, Integer distance) {
+            long startMs, int value, ZoneId zone, Integer calories, Integer distance,
+            long endMs, String mode) {
         JSONObject json = new JSONObject();
         try {
             json.put("recordId", recordId(deviceId, kind, startMs));
             json.put("deviceId", deviceId);
             json.put("kind", kind);
             json.put("startMs", startMs);
-            json.put("endMs", startMs + MINUTE_MS);
+            json.put("endMs", endMs);
             json.put("value", value);
             json.put("stage", JSONObject.NULL);
             json.put("timezone", zone.getId());
             json.put("sourceFingerprint", fingerprint(deviceId, kind, startMs, value,
                     calories, distance));
-            json.put("measurementMode", "continuous");
+            json.put("measurementMode", mode);
             json.put("complete", false);
             if (calories != null && calories >= 0) json.put("calories", calories);
             if (distance != null && distance >= 0) json.put("distance", distance);
