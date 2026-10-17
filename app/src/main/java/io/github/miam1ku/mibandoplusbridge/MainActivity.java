@@ -19,6 +19,7 @@ import io.github.miam1ku.mibandoplusbridge.data.TransportObservation;
 import io.github.miam1ku.mibandoplusbridge.integration.DeviceCardProvider;
 import org.json.JSONObject;
 import androidx.appcompat.app.AppCompatActivity;
+import android.content.ComponentName;
 import android.content.Intent;
 import android.database.ContentObserver;
 import android.os.Bundle;
@@ -36,8 +37,10 @@ import io.github.miam1ku.mibandoplusbridge.ui.SetupProgress;
 import io.github.miam1ku.mibandoplusbridge.integration.CredentialProvider;
 import io.github.miam1ku.mibandoplusbridge.integration.HealthQueueProvider;
 import io.github.miam1ku.mibandoplusbridge.data.BandStateRepository;
+import io.github.miam1ku.mibandoplusbridge.data.HuaweiDeviceRegistry;
 import io.github.miam1ku.mibandoplusbridge.service.OwnershipController;
 import io.github.miam1ku.mibandoplusbridge.service.BandLiveService;
+import io.github.miam1ku.mibandoplusbridge.service.HuaweiPairActivity;
 import io.github.miam1ku.mibandoplusbridge.notify.BandNotificationListener;
 import io.github.miam1ku.mibandoplusbridge.notify.SleepMusic;
 import io.github.miam1ku.mibandoplusbridge.protocol.BandNotificationCommand;
@@ -149,7 +152,9 @@ public final class MainActivity extends AppCompatActivity {
         screen.navRow(shortcuts, "协议测试", () -> startActivity(new Intent(this, LabActivity.class)));
         screen.navRow(shortcuts, "天气同步", () -> startActivity(new Intent(this, WeatherActivity.class)));
         screen.navRow(shortcuts, "发送调试日志到 QQ", this::shareDebugLog);
-        screen.caption(shortcuts, "控制中心编辑里添加「手环」。下拉或点一下会拉起连接，不会断开。");
+        screen.caption(shortcuts, HuaweiDeviceRegistry.provisioned(this)
+                ? "手表磁贴由设备空间自动维护，下拉快捷面板点一下即可拉起连接，不会断开。"
+                : "控制中心编辑里添加「手环」。下拉或点一下会拉起连接，不会断开。");
         screen.setLastChildMargin(shortcuts, 0);
         LinearLayout sleepCard = screen.card();
         MaterialSwitch sleepPause = new MaterialSwitch(this);
@@ -397,9 +402,13 @@ public final class MainActivity extends AppCompatActivity {
                 }
                 message = !registered
                         ? (needsOfficialRestore() ? "尚未登记，官方应用仍处于暂停状态。可添加设备或恢复官方管理。" : "尚未添加设备。")
-                        : "NATIVE".equals(owner.mode())
-                                ? "已由桥接管理。连接状态以设备实际响应为准。"
-                                : "当前由小米运动健康管理。可点击连接重新接管。";
+                        : HuaweiDeviceRegistry.provisioned(this)
+                                // 华为链路没有小米所有权可接管：设备由桥接直接管理，
+                                // 落回小米文案会让人以为还要去接管小米运动健康。
+                                ? "已由桥接直接管理（华为链路），无需小米运动健康参与。"
+                                : "NATIVE".equals(owner.mode())
+                                        ? "已由桥接管理。连接状态以设备实际响应为准。"
+                                        : "当前由小米运动健康管理。可点击连接重新接管。";
             } catch (Exception failure) {
                 message = repository.isRegistered()
                         ? "设备登记已保留。连接恢复未完成，请重试或恢复官方管理。"
@@ -418,6 +427,42 @@ public final class MainActivity extends AppCompatActivity {
         if (worker.isShutdown() || changingOwnership) return;
         if (!rootGranted) {
             requestRoot();
+            return;
+        }
+        // 华为设备没有小米所有权可恢复：移除 = 清注册表 + 停服务 + 注销设备空间卡片，
+        // 走下面那套小米 machinery 只会报 DEVICE_IDENTITY_CHANGED。
+        if (change == Change.REMOVE && HuaweiDeviceRegistry.provisioned(this)) {
+            if (!isUnlocked()) {
+                ownershipStatus.setText("请先解锁手机，再管理设备。");
+                return;
+            }
+            changingOwnership = true;
+            updateControls();
+            ownershipStatus.setText("正在移除，请稍候…");
+            worker.execute(() -> {
+                String message;
+                try {
+                    HuaweiDeviceRegistry.clear(this);
+                    BandLiveService.stop(this);
+                    // 华为表移除后设备空间不再自动上磁贴，桥接自己的磁贴恢复供用户手动添加。
+                    io.github.miam1ku.mibandoplusbridge.service.BandTileService
+                            .setEnabled(this, true);
+                    // registered=false 让 DeviceCardProvider 停止供卡，设备空间观察者随即撤卡。
+                    io.github.miam1ku.mibandoplusbridge.data.LocalPrefs.open(this, "band-state")
+                            .edit().putBoolean("registered", false).commit();
+                    message = "已移除华为设备，可随时重新配对。";
+                } catch (Exception failure) {
+                    message = "移除未完成：" + failureHint(failure);
+                }
+                String visible = message;
+                main.post(() -> {
+                    if (isDestroyed()) return;
+                    changingOwnership = false;
+                    ownershipStatus.setText(visible);
+                    updateControls();
+                    refreshDevice();
+                });
+            });
             return;
         }
         if (!isUnlocked()) {
@@ -589,6 +634,13 @@ public final class MainActivity extends AppCompatActivity {
 
     private SetupProgress readProgress() {
         boolean registered = new BandStateRepository(this).isRegistered();
+        // 华为表（GT3）不经过小米运动健康：绑定事实在 HuaweiDeviceRegistry，
+        // 健康侧注册由 HuaweiDeviceRegistry.publish() 随会话自动写进 band-state。
+        // 小米三步（导入绑定 / 采集连接参数 / 添加到健康）对它一步都不适用，
+        // 不分支就会永远停在「导入绑定」——2026-10-17 实机正是如此。
+        if (HuaweiDeviceRegistry.provisioned(this)) {
+            return new SetupProgress(rootGranted, true, true, registered, true, true, true);
+        }
         boolean hasBinding = false;
         String model = "";
         try {
@@ -606,7 +658,7 @@ public final class MainActivity extends AppCompatActivity {
         try {
             accountConfirmed = new HealthRecordStore(this).confirmedAccountHash() != null;
         } catch (Exception ignored) { }
-        return new SetupProgress(rootGranted, hasBinding, hasProfile, registered, nativeOwned, accountConfirmed);
+        return new SetupProgress(rootGranted, hasBinding, hasProfile, registered, nativeOwned, accountConfirmed, false);
     }
     private void bindChecklist(SetupProgress progress) {
         bindChecklistRow(checklistRoot, progress, SetupProgress.Step.ROOT, "KernelSU 授权");
@@ -638,13 +690,42 @@ public final class MainActivity extends AppCompatActivity {
 
     private void runHomePrimary() {
         if (changingOwnership || probingRoot) return;
-        switch (readProgress().current()) {
+        SetupProgress progress = readProgress();
+        // Root 是两条链路共同的前置，先处理。
+        if (progress.current() == SetupProgress.Step.ROOT) {
+            requestRoot();
+            return;
+        }
+        // 华为设备没有小米所有权可接管：主按钮直接进重新配对入口。
+        if (progress.huawei) {
+            startHuaweiPairing();
+            return;
+        }
+        switch (progress.current()) {
             case ROOT -> requestRoot();
             case IMPORT -> startBindingImport();
             case PROFILE -> startProfileCapture();
             case ADD -> requestNative(Change.ADD);
             case DONE -> requestNative(Change.RECONNECT);
         }
+    }
+
+    /**
+     * 重新配对：拉起华为配对入口（同应用 Activity，MAC 取自注册表）。
+     * 首次认证时手表会弹确认；成功后注册表落盘，BandLiveService 随后的连接全部走 bind。
+     */
+    private void startHuaweiPairing() {
+        String mac = HuaweiDeviceRegistry.address(this);
+        if (mac.isBlank()) {
+            ownershipStatus.setText("尚未登记华为设备，请先配对。");
+            return;
+        }
+        Intent intent = new Intent();
+        intent.setComponent(new ComponentName(this, HuaweiPairActivity.class));
+        intent.putExtra("mac", mac);
+        intent.putExtra("model", HuaweiDeviceRegistry.model(this));
+        intent.putExtra("autostart", true);
+        startActivity(intent);
     }
 
     private void refreshDevice() {

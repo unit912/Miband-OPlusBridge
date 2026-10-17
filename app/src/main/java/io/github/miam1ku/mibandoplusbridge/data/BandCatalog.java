@@ -80,6 +80,10 @@ public final class BandCatalog {
             {"miwear.watch.o65", "REDMI Watch 5", "watch"},
             {"miwear.watch.p65", "REDMI Watch 6", "watch"},
             {"miwear.watch.q65", "REDMI Watch 6 活力版", "watch"},
+            // Huawei BR/EDR watches. The space card and the health category both follow the watch form.
+            {"huawei.watch.gt3", "HUAWEI WATCH GT3", "watch"},
+            {"huawei.watch.gt2", "HUAWEI WATCH GT2", "watch"},
+            {"huawei.watch.gt", "HUAWEI WATCH GT", "watch"},
     };
 
     /**

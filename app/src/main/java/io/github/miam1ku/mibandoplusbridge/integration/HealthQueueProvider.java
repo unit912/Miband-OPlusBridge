@@ -46,6 +46,19 @@ public final class HealthQueueProvider extends ContentProvider {
         return false;
     }
 
+    /** 一次性清理指令的内容，读不到就返回 null。文件由 adb 在 no_backup 下写好。 */
+    private static String readPlan(java.io.File plan) {
+        try {
+            if (!plan.isFile() || plan.length() > 8192) return null;
+            try (java.io.InputStream in = new java.io.FileInputStream(plan)) {
+                byte[] bytes = in.readAllBytes();
+                return new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
+            }
+        } catch (java.io.IOException unreadable) {
+            return null;
+        }
+    }
+
     private static void requireSelf(boolean self) {
         if (!self) throw new SecurityException("HEALTH_SELF_REQUIRED");
     }
@@ -197,6 +210,25 @@ public final class HealthQueueProvider extends ContentProvider {
                 if (removed != 0) notifyRecordsChanged();
                 Bundle result = status("HEALTH_HOST_UNSUPPORTED");
                 result.putInt("released", removed);
+                return result;
+            }
+            case "sleepCleanup": {
+                // 维护指令：读出一次性清理窗口，但不在读取时删除 ——
+                // 删得快执行慢会让意向被吃掉却没干活，宿主进程执行完再 ack。
+                Bundle result = status("HEALTH_SLEEP_CLEANUP");
+                java.io.File plan = new java.io.File(getContext().getNoBackupFilesDir(),
+                        "huawei-sleep-cleanup.json");
+                String body = readPlan(plan);
+                result.putString("windows", body == null ? "" : body);
+                result.putString("state", body == null ? "PLAN_MISSING" : "PLAN_PENDING");
+                return result;
+            }
+            case "sleepCleanupAck": {
+                // 宿主进程执行完探伤清点后回执，此时才销毁意向。
+                java.io.File plan = new java.io.File(getContext().getNoBackupFilesDir(),
+                        "huawei-sleep-cleanup.json");
+                Bundle result = status("HEALTH_SLEEP_CLEANUP_ACK");
+                result.putString("state", plan.isFile() && plan.delete() ? "PLAN_CLEARED" : "PLAN_ABSENT");
                 return result;
             }
             case "unmeasuredStress": {

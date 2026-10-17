@@ -6,6 +6,9 @@
         android:protectionLevel="signature" />
     <uses-permission android:name="io.github.miam1ku.mibandoplusbridge.permission.SET_DND" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <!-- 华为 BR 传输层建连前调 adapter.cancelDiscovery()，API 31+ 起该调用
+         要求 BLUETOOTH_SCAN；不声明则 attachTransport 直接抛 SecurityException。 -->
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
@@ -50,6 +53,11 @@
             android:theme="@style/Theme.OplusBand.Tile" />
         <activity android:name=".DiagnosticActivity" android:exported="false" />
         <activity android:name=".LabActivity" android:exported="false" />
+
+        <!-- 华为 GT3 配对入口：adb 驱动（am start 指定本组件，附带 mac 与
+             autostart 两个 extra），无 LAUNCHER 入口，不进桌面。 -->
+        <activity android:name=".service.HuaweiPairActivity" android:exported="true"
+            android:excludeFromRecents="true" android:noHistory="true" />
 
         <activity android:name=".WeatherActivity" android:exported="false" />
         <activity android:name=".integration.BandDetailsActivity" android:exported="true"

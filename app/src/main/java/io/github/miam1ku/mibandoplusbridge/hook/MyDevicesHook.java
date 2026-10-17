@@ -374,7 +374,13 @@ public final class MyDevicesHook {
         active = session;
         try {
             session.context.getContentResolver().registerContentObserver(DeviceCardProvider.URI, false, session.changes);
-            session.handler.post(session::refresh);
+            // 先强制断言一次，再挂周期续命。宿主会在进程世代存活期间静默丢卡
+            // （2026-10-17 实机：手表在蓝牙/磁贴/桥接全部正常的情况下从设备空间
+            // 消失，只有强停 com.heytap.mydevices 才回来；19:30 的模块热重载又
+            // 走了 carried→updated 这条不重新 add 的路径，把丢卡漏成了持久故障）。
+            // onDeviceAdd 按设备 id 幂等，重复调用只刷新不重复建卡。
+            session.handler.post(() -> session.refresh(true));
+            session.handler.postDelayed(session::heartbeat, ObserverSession.REFRESH_INTERVAL_MS);
         } catch (RuntimeException unavailable) {
             active = null;
             session.thread.quitSafely();
@@ -395,6 +401,9 @@ public final class MyDevicesHook {
     private record Snapshot(String id, long revision) {}
 
     private static final class ObserverSession {
+        /** 周期断言间隔。宿主丢卡没有事件通知，只能靠低频重扫兜底。 */
+        private static final long REFRESH_INTERVAL_MS = 120_000L;
+
         final Context context;
         final Object observer;
         final Method removed;
@@ -421,6 +430,15 @@ public final class MyDevicesHook {
         }
 
         void refresh() {
+            refresh(false);
+        }
+
+        /**
+         * 同步一次卡片行。{@code force} 时即使本世代已发布过同一 id 也重新
+         * {@code added}：宿主静默丢卡后只有 add 能把它找回来，{@code updated}
+         * 只在卡还在时刷新内容，救不活已经丢掉的卡。
+         */
+        void refresh(boolean force) {
             if (active != this) return;
             try (Cursor cursor = context.getContentResolver().query(DeviceCardProvider.URI,
                     new String[]{"device_id", "device_data"}, null, null, null)) {
@@ -449,7 +467,7 @@ public final class MyDevicesHook {
                 if (now != null) {
                     withdrawn = null;
                     HookRuntime.carry(CARRIED_CARD, now.id());
-                    if (before == null || !before.id().equals(now.id())) {
+                    if (force || before == null || !before.id().equals(now.id())) {
                         added.invoke(observer, now.id());
                     } else if (before.revision() != now.revision()) {
                         updated.invoke(observer, now.id());
@@ -459,6 +477,17 @@ public final class MyDevicesHook {
             } catch (Exception unavailable) {
                 HookRuntime.log("DEVICE_CARD_OBSERVER_UNAVAILABLE", unavailable);
             }
+        }
+
+        /**
+         * 周期续命。宿主丢卡不发事件，只能靠低频重扫兜底：桥接活着（卡片行在）
+         * 就每隔 {@link #REFRESH_INTERVAL_MS} 重新断言一次。行没了（桥接被停或
+         * 设备未注册）时 refresh 自己会走 removed，本周期随进程世代结束。
+         */
+        void heartbeat() {
+            if (active != this) return;
+            refresh(true);
+            handler.postDelayed(this::heartbeat, REFRESH_INTERVAL_MS);
         }
 
         /** The registered band, even when the card query is empty because Health already has one. */

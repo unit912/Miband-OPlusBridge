@@ -20,9 +20,16 @@ public final class OHealthLockCardHookTest {
         assertTrue(OHealthLockCardHook.newerHeart("not-json", 10));
     }
 
-    @Test public void stepsKeepWhicheverTotalIsAhead() {
-        assertEquals(43, OHealthLockCardHook.stepToShow(43, 21));
-        assertEquals(8000, OHealthLockCardHook.stepToShow(43, 8000));
-        assertEquals(43, OHealthLockCardHook.stepToShow(43, -1));
+    @Test public void theWatchTotalIsAuthoritativeWhenItIsFromToday() {
+        long now = System.currentTimeMillis();
+        long yesterday = now - 24L * 60 * 60 * 1000 - 1000;
+        // Fresh sample: the watch total replaces the shown value, even below it.
+        assertEquals(21, OHealthLockCardHook.stepToShow(43, 21, now));
+        assertEquals(8000, OHealthLockCardHook.stepToShow(43, 8000, now));
+        // Invalid totals keep the shown value.
+        assertEquals(43, OHealthLockCardHook.stepToShow(43, -1, now));
+        assertEquals(43, OHealthLockCardHook.stepToShow(43, 0, now));
+        // Yesterday's snapshot must not leak onto a new day's card.
+        assertEquals(43, OHealthLockCardHook.stepToShow(43, 8000, yesterday));
     }
 }

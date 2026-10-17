@@ -1,0 +1,132 @@
+// 离线握手自检 APK —— 只跑协议握手，不接入 OPPO 健康 / 设备空间。
+//
+// 为什么单独一个模块
+// ------------------
+// 移植来的华为协议栈要验证，只能真机连表跑握手。而 bridge 主模块是个 Xposed 模块：
+// 它要 LSPosed 注入才有完整的 context，握手日志也散在 SessionLog 里，
+// 出错时很难判断是协议错了还是宿主环境没就绪。
+//
+// 这个模块把 huawei 协议源码<b>按路径引用</b>过来（sourceSets.srcDirs），
+// 不是复制一份 —— 协议改动在这里立刻能验证，不存在两份代码走偏的问题。
+//
+// 它与主模块共享的部分
+// ------------------
+//   protocol/huawei/**        协议栈全部（core / packets / requests / service / br / btbr）
+//   data/HuaweiLogger.java    日志门面
+//   data/SessionLog.java      落盘日志
+//
+// 不共享的部分：BandLiveService、hook、integration、Spp* 小米链路 —— 与本次验证无关，
+// 且会拖进 protobuf 与 OPPO 依赖，让「自检 APK 能不能装上」变得不纯粹。
+//
+// 为什么不用 AppCompat
+// -------------------
+// 自检界面只需要输入框 + 按钮 + 一个滚动文本区，framework 的 Activity 全都能做。
+// 引入 appcompat 会连带 drawerlayout / viewpager / kotlin-stdlib 一串传递依赖，
+// 而本机 Gradle 是离线构建、缓存不全，装不上。与其为三个控件拖一串库，
+// 不如直接用 framework API —— 自检 APK 越薄，装机越不会出岔子。
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'io.github.miam1ku.mibandoplusbridge.probe'
+    compileSdk 36
+    buildToolsVersion '35.0.0'
+
+    defaultConfig {
+        // 独立 applicationId：可与已安装的 bridge 主模块并存，互不覆盖。
+        applicationId 'io.github.miam1ku.mibandoplusbridge.probe'
+        // minSdk 必须 ≤ 目标机的 API 等级，否则 adb install 直接被
+        // INSTALL_FAILED_OLDER_SDK 挡掉。一加 Ace 5 Pro 是 Android 15 / API 35，
+        // 所以按 35 走。compileSdk 仍留 36：编译期可以用更高平台的 API，
+        // 只要运行时不调用 36 才有的东西（本模块只碰 framework 蓝牙 API）。
+        minSdk 35
+        targetSdk 35
+        versionCode 1
+        versionName '1.0-probe'
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    // 复用主模块的协议源码，而不是复制。
+    //
+    // 这里用 exclude 而不是 include：include 的匹配是相对每个 srcDir 根的，
+    // 多 srcDir 时判定不稳（实测把 ui/BridgeScreen.java 也收进来了，
+    // 于是报出一堆 MaterialButton 找不到符号的无关错误）。
+    // exclude 反过来写 —— 明确列出不要的顶层包，剩下的自然只有协议栈。
+    sourceSets {
+        main {
+            java.srcDirs = [
+                    'src/main/java',
+                    '../app/src/main/java',
+            ]
+            java.exclude 'io/github/miam1ku/mibandoplusbridge/MainActivity.java'
+            java.exclude 'io/github/miam1ku/mibandoplusbridge/BridgeApplication.java'
+            java.exclude 'io/github/miam1ku/mibandoplusbridge/DiagnosticActivity.java'
+            java.exclude 'io/github/miam1ku/mibandoplusbridge/LabActivity.java'
+            java.exclude 'io/github/miam1ku/mibandoplusbridge/WeatherActivity.java'
+            java.exclude 'io/github/miam1ku/mibandoplusbridge/HostIdentity.java'
+            java.exclude 'io/github/miam1ku/mibandoplusbridge/HostVersionNotice.java'
+            java.exclude 'io/github/miam1ku/mibandoplusbridge/UpdateChecker.java'
+            // data/ 只留日志门面与落盘，其余（预置、账号、绑定状态）都属主模块
+            java.exclude 'io/github/miam1ku/mibandoplusbridge/data/AuthToken.java'
+            java.exclude 'io/github/miam1ku/mibandoplusbridge/data/BandCatalog.java'
+            java.exclude 'io/github/miam1ku/mibandoplusbridge/data/BandStateRepository.java'
+            java.exclude 'io/github/miam1ku/mibandoplusbridge/data/BindingShape.java'
+            java.exclude 'io/github/miam1ku/mibandoplusbridge/data/BindingStore.java'
+            java.exclude 'io/github/miam1ku/mibandoplusbridge/data/HealthRecord.java'
+            java.exclude 'io/github/miam1ku/mibandoplusbridge/data/HealthRecordStore.java'
+            java.exclude 'io/github/miam1ku/mibandoplusbridge/data/HuaweiDeviceRegistry.java'
+            // 睡眠/步数导入器走 OPPO 健康落库（HealthRecordStore + BandHistoryParser），
+            // 两者都在排除清单里，导入器本身也必须排除，否则 probe 编译找不到符号。
+            java.exclude 'io/github/miam1ku/mibandoplusbridge/data/HuaweiSleepImporter.java'
+            java.exclude 'io/github/miam1ku/mibandoplusbridge/data/HuaweiStepsImporter.java'
+            java.exclude 'io/github/miam1ku/mibandoplusbridge/data/ImportWindow.java'
+            java.exclude 'io/github/miam1ku/mibandoplusbridge/data/LegacyPrefsMigration.java'
+            java.exclude 'io/github/miam1ku/mibandoplusbridge/data/LocalPrefs.java'
+            java.exclude 'io/github/miam1ku/mibandoplusbridge/data/MacIds.java'
+            java.exclude 'io/github/miam1ku/mibandoplusbridge/data/ProtocolCaptureStore.java'
+            java.exclude 'io/github/miam1ku/mibandoplusbridge/data/RawFitnessFileStore.java'
+            java.exclude 'io/github/miam1ku/mibandoplusbridge/data/SleepStageAlign.java'
+            java.exclude 'io/github/miam1ku/mibandoplusbridge/data/TransportObservation.java'
+            // protocol/ 下只留 huawei，小米那条链路与 LiveSession 抽象不参与
+            java.exclude 'io/github/miam1ku/mibandoplusbridge/protocol/*.java'
+            // 主模块的其余顶层包一概排除
+            java.exclude 'io/github/miam1ku/mibandoplusbridge/hook/**'
+            java.exclude 'io/github/miam1ku/mibandoplusbridge/integration/**'
+            java.exclude 'io/github/miam1ku/mibandoplusbridge/notify/**'
+            java.exclude 'io/github/miam1ku/mibandoplusbridge/service/**'
+            java.exclude 'io/github/miam1ku/mibandoplusbridge/ui/**'
+        }
+    }
+
+    buildTypes {
+        debug {
+            // 自检 APK 走 AGP 默认的 debug keystore：它只在自己进程里用，
+            // 不替换主模块已装的签名。
+        }
+        release {
+            minifyEnabled false
+        }
+    }
+
+    lint {
+        // 自检工具不需要打包检查，失败时直接看构建日志更快。
+        abortOnError false
+    }
+}
+
+dependencies {
+    // 华为协议栈用 bouncycastle 做 AES-GCM / HKDF。协议栈里没有其他三方库，
+    // 所以这一条就是全部运行时依赖。
+    implementation 'org.bouncycastle:bcprov-jdk18on:1.81'
+
+    // 协议栈里 @NonNull / @Nullable 仅用于类型标注，不参与运行。
+    // 主模块通过 AGP 自带的 annotation 拿到它，这里显式给一份本地 jar，
+    // 免得再拉 androidx 那一串传递依赖。
+    // 路径写成 project 绝对定位：从 bridge 目录往上两级就是 work/。
+    compileOnly files("${rootDir.parentFile}/toolchain/ann-1.5.0.jar")
+}

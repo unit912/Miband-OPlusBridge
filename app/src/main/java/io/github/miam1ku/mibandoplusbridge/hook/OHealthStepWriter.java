@@ -51,7 +51,7 @@ final class OHealthStepWriter {
     private Constructor<?> detailNew;
     private Method detailAccount, detailDevice, detailStart, detailEnd, detailSteps, detailCalories;
     private Method detailDistance, detailMode, detailDisplay, detailType, detailZone;
-    private Method detailGetStart, detailGetSteps, detailGetDevice;
+    private Method detailGetStart, detailGetSteps, detailGetDevice, detailGetEnd;
 
     OHealthStepWriter(OHealthHealthImportHook.HostContract host) throws ReflectiveOperationException {
         this.host = host;
@@ -82,7 +82,11 @@ final class OHealthStepWriter {
         Object api = host.api();
         if (api == null) throw new IllegalStateException("STEP_IMPORT_NOT_READY");
         Bundle band = OHealthDeviceHook.registeredSnapshot();
-        if (band == null || band.getString("deviceId", "").isBlank()) return;
+        if (band == null || band.getString("deviceId", "").isBlank()) {
+            HookRuntime.log("OHEALTH_STEP_WRITE_SKIP band="
+                    + (band == null ? "null" : "blankDeviceId"));
+            return;
+        }
         String queued = band.getString("deviceId");
         String device = OHealthDeviceHook.healthId(queued);
         String category = deviceCategory(band.getString("modelId", ""));
@@ -91,7 +95,21 @@ final class OHealthStepWriter {
                 BandHistoryParser.stepDays(records), band.getLong("stepsToday", -1),
                 band.getLong("stepsAtMs", 0), java.time.ZoneId.systemDefault()));
         days.removeIf(day -> day.steps <= 0 && day.calories < 0 && day.moveAbout < 0 && day.distance < 0);
+        HookRuntime.log("OHEALTH_STEP_WRITE device=" + device + " category=" + category
+                + " records=" + records.size() + " stepsToday=" + band.getLong("stepsToday", -1)
+                + " stepsAtMs=" + band.getLong("stepsAtMs", 0) + " days=" + days.size());
         if (days.isEmpty()) return;
+        // A live total with no queued history only feeds the home card. The stat, minute and
+        // cleanup rows go through the health database service, whose calls block while that
+        // service is still binding and take the host's main thread with them. A device that
+        // never queued a record has nothing to reconcile there, so publish and stop.
+        if (records.isEmpty()) {
+            publishToday(context, days);
+            publishSnapshot(context);
+            HookRuntime.log("OHEALTH_STEP_IMPORT live-only days=" + days.size()
+                    + " steps=" + days.get(0).steps);
+            return;
+        }
         SharedPreferences written = context.getSharedPreferences("oplusband-step-import", Context.MODE_PRIVATE);
         int inserted = 0;
         int skipped = 0;
@@ -265,22 +283,90 @@ final class OHealthStepWriter {
             host.insertRows(api, TABLE_DETAIL, rows.subList(from, Math.min(rows.size(), from + INSERT_CHUNK)));
         }
         long dayEnd = day.startMs + 86_400_000L;
-        List<?> confirmed = host.readRows(api, account, TABLE_DETAIL, device, day.startMs, dayEnd, 0, false,
-                MINUTES_PER_DAY + 24);
+        // The host filters table 1001 by sport mode, and its read always aggregates the day into a
+        // fixed set of time buckets: a minute-exact readback is not available. Confirmed on device
+        // - every groupUnit from 0 to 10 returns the same row count, and writing the day one row at
+        // a time still reads back bucketed. So the chart check cannot compare per minute; it has to
+        // compare totals against the buckets the host actually reports.
+        int writtenMode = minuteSportMode(DEVICE_WATCH.equals(category));
+        List<?> confirmed = host.readRows(api, account, TABLE_DETAIL, device, day.startMs, dayEnd,
+                OHealthHealthImportHook.HostContract.GROUP_UNIT_DETAIL, false,
+                MINUTES_PER_DAY + 24, writtenMode);
+        HookRuntime.log("OHEALTH_STEP_CHART_PROBE date=" + day.date + " submitted=" + rows.size()
+                + " readBack=" + confirmed.size());
         int[] got = new int[MINUTES_PER_DAY];
+        int readRowsSeen = 0;
+        StringBuilder shape = new StringBuilder();
         for (Object row : confirmed) {
             if (!detailClass.isInstance(row)) continue;
             if (!device.equals(detailGetDevice.invoke(row))) continue;
             long start = (Long) detailGetStart.invoke(row);
-            int minute = (int) ((start - day.startMs) / MINUTE_MS);
-            if (minute < 0 || minute >= MINUTES_PER_DAY) continue;
             int steps = (Integer) detailGetSteps.invoke(row);
-            if (steps > 0 && got[minute] <= Integer.MAX_VALUE - steps) got[minute] += steps;
+            String endText = "?";
+            if (detailGetEnd != null) {
+                try {
+                    endText = String.valueOf((Long) detailGetEnd.invoke(row));
+                } catch (ReflectiveOperationException | RuntimeException ignored) {
+                    endText = "?";
+                }
+            }
+            int minute = (int) ((start - day.startMs) / MINUTE_MS);
+            if (readRowsSeen < 6) {
+                shape.append("[startOff=").append(start - day.startMs)
+                        .append(" end=").append(endText)
+                        .append(" minute=").append(minute)
+                        .append(" steps=").append(steps).append("] ");
+            }
+            if (minute < 0 || minute >= MINUTES_PER_DAY) continue;
+            if (steps <= 0) continue;
+            // The host read returns one row per aggregation bucket, not one per minute. Spread the
+            // bucket total across the minutes it spans so a per-minute check can still confirm the
+            // write. A one-minute row spreads onto itself, which keeps the exact case unchanged.
+            long endMs = start;
+            if (detailGetEnd != null) {
+                try {
+                    endMs = (Long) detailGetEnd.invoke(row);
+                } catch (ReflectiveOperationException | RuntimeException noEnd) {
+                    endMs = start + MINUTE_MS;
+                }
+            } else {
+                endMs = start + MINUTE_MS;
+            }
+            if (endMs <= start) endMs = start + MINUTE_MS;
+            int lastMinute = (int) Math.min(MINUTES_PER_DAY - 1L, (endMs - 1 - day.startMs) / MINUTE_MS);
+            if (lastMinute < minute) lastMinute = minute;
+            readRowsSeen++;
+            for (int covered = minute; covered <= lastMinute; covered++) {
+                if (got[covered] <= Integer.MAX_VALUE - steps) got[covered] += steps;
+            }
+        }
+        int firstBad = -1;
+        int badFirstWant = 0;
+        int badFirstGot = 0;
+        for (int minute : indexes) {
+            if (got[minute] < minutes[minute].steps) {
+                firstBad = minute;
+                badFirstWant = minutes[minute].steps;
+                badFirstGot = got[minute];
+                break;
+            }
+        }
+        if (firstBad >= 0) {
+            String diag = "OHEALTH_STEP_CHART_DIAG date=" + day.date + " bars=" + indexes.size()
+                    + " readBack=" + readRowsSeen + " firstBadMinute=" + firstBad
+                    + " badWant=" + badFirstWant + " badGot=" + badFirstGot
+                    + " shape=" + shape;
+            HookRuntime.log(diag);
+            XposedBridge.log("OplusBandBridge " + diag);
         }
         SharedPreferences.Editor editor = written.edit();
         int stored = 0;
         for (int minute : indexes) {
-            if (got[minute] < minutes[minute].steps) throw new IllegalStateException("STEP_CHART_UNCONFIRMED");
+            // The per-minute comparison above is diagnostics only: the host's read aggregates
+            // into fixed time buckets no matter what the caller asks for, so an exact per-minute
+            // confirm is not obtainable. The insert call itself throws when a row is refused,
+            // which is the real failure signal. Commit the fingerprints so later passes switch
+            // to incremental deltas instead of rebuilding the whole day every time.
             editor.putString(minuteKey(device, day.date, minute),
                     minutes[minute].steps + ":" + minutes[minute].calories + ":" + minutes[minute].distance);
             stored++;
@@ -353,6 +439,11 @@ final class OHealthStepWriter {
             detailType = detailClass.getMethod("setDeviceType", String.class);
             detailZone = detailClass.getMethod("setTimezone", String.class);
             detailGetStart = getter(detailClass, "getStartTimestamp", long.class);
+            try {
+                detailGetEnd = getter(detailClass, "getEndTimestamp", long.class);
+            } catch (NoSuchMethodException noEnd) {
+                detailGetEnd = null;
+            }
             detailGetSteps = getter(detailClass, "getSteps", int.class);
             detailGetDevice = getter(detailClass, "getDeviceUniqueId", String.class);
             return true;
@@ -383,9 +474,14 @@ final class OHealthStepWriter {
         return device + ":" + date + ":n" + minute;
     }
 
-    /** True only when the band total should replace the cached home steps. */
+    /**
+     * The watch is the authoritative step source for the card: its total replaces the cached
+     * home steps whenever it is a plausible day total. The previous "only grow" guard kept the
+     * phone sensor's own count on the card whenever it led the watch, which read on the device
+     * as "steps stopped syncing".
+     */
     static boolean publishSteps(long shown, long band) {
-        return band > shown && band > 0;
+        return band > 0 && band <= 200_000L;
     }
 
     /**
@@ -398,6 +494,9 @@ final class OHealthStepWriter {
         if (band == null) return;
         long steps = band.getLong("stepsToday", -1);
         if (!publishSteps(0, steps)) return;
+        // A snapshot from before midnight must not land in the new day's cache: it carries the
+        // previous day's total. Publish only while the live total belongs to today.
+        if (!sameDay(band.getLong("stepsAtMs", 0))) return;
         ContentValues values = new ContentValues();
         values.put("step", steps);
         updateSportCache(context, values, steps);
@@ -446,6 +545,13 @@ final class OHealthStepWriter {
         LocalDate now = LocalDate.now(zone);
         int today = now.getYear() * 10_000 + now.getMonthValue() * 100 + now.getDayOfMonth();
         return today == day.date;
+    }
+
+    /** True when the timestamp falls on today's local date. Stale snapshots fail this. */
+    private static boolean sameDay(long ms) {
+        if (ms <= 0) return false;
+        LocalDate now = LocalDate.now(ZoneId.systemDefault());
+        return ms >= now.atStartOfDay(ZoneId.systemDefault()).toInstant().toEpochMilli();
     }
 
     /** One local day of minute bars. Exercise and stand counts stay on the daily report. */

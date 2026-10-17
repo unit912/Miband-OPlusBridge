@@ -838,6 +838,10 @@ public final class OHealthHealthImportHook {
         final ClassLoader loader;
         final EnumMap<OHealthHealthModels.Kind, OHealthHealthModels> models =
                 new EnumMap<>(OHealthHealthModels.Kind.class);
+        /** Dispatch thread for host reads, replaced when one stalls. See {@link #awaitRead}. */
+        private volatile java.util.concurrent.ExecutorService reader;
+        private final java.util.concurrent.atomic.AtomicInteger readStalls =
+                new java.util.concurrent.atomic.AtomicInteger();
 
         HostContract(ClassLoader loader) throws ReflectiveOperationException {
             this.loader = loader;
@@ -900,8 +904,16 @@ public final class OHealthHealthImportHook {
         void insert(Object api, Object option) throws ReflectiveOperationException {
             Object observer = observerConstructor.newInstance();
             try {
-                subscribe.invoke(insert.invoke(api, option), observer);
-                if (!Boolean.TRUE.equals(observerResult.invoke(observer))) {
+                AtomicReference<Object> reported = new AtomicReference<>();
+                dispatchHost(() -> {
+                    try {
+                        subscribe.invoke(insert.invoke(api, option), observer);
+                        reported.set(observerResult.invoke(observer));
+                    } catch (ReflectiveOperationException | RuntimeException failure) {
+                        throw new IllegalStateException(failure);
+                    }
+                });
+                if (!Boolean.TRUE.equals(reported.get())) {
                     throw new IllegalStateException("IMPORT_INSERT_UNCONFIRMED");
                 }
             } finally {
@@ -931,8 +943,17 @@ public final class OHealthHealthImportHook {
             Object observer = observerConstructor.newInstance();
             boolean reportedSuccess = false;
             try {
-                subscribe.invoke(api.getClass().getMethod("deleteSportHealthData", type).invoke(api, option), observer);
-                reportedSuccess = Boolean.TRUE.equals(observerResult.invoke(observer));
+                AtomicReference<Object> reported = new AtomicReference<>();
+                dispatchHost(() -> {
+                    try {
+                        subscribe.invoke(api.getClass().getMethod("deleteSportHealthData", type)
+                                .invoke(api, option), observer);
+                        reported.set(observerResult.invoke(observer));
+                    } catch (ReflectiveOperationException | RuntimeException failure) {
+                        throw new IllegalStateException(failure);
+                    }
+                });
+                reportedSuccess = Boolean.TRUE.equals(reported.get());
             } finally {
                 try { observerDispose.invoke(observer); } catch (ReflectiveOperationException ignored) { }
             }
@@ -953,8 +974,9 @@ public final class OHealthHealthImportHook {
         /** Detail deletes use the same inclusive host end as the read, so an empty read confirms one. */
         private boolean minuteRowsRemain(Object api, String account, String device, long start, long end)
                 throws Exception {
+            // No mode filter: this only asks whether any row is left, whatever mode it carries.
             return !readRows(api, account, OHealthStepWriter.TABLE_DETAIL, device,
-                    Math.max(0, start), end - 1, 0, false, 1).isEmpty();
+                    Math.max(0, start), end - 1, 0, false, 1, null).isEmpty();
         }
 
         /** Same post-insert cloud request as databaseengineservice. A cloud failure leaves the local row. */
@@ -1015,6 +1037,21 @@ public final class OHealthHealthImportHook {
 
         List<?> readRows(Object api, String account, int table, String device, long start, long end,
                 int groupUnit, boolean parse, int limit) throws Exception {
+            return readRows(api, account, table, device, start, end, groupUnit, parse, limit, null);
+        }
+
+        /**
+         * The group unit the host library uses for a DETAIL read. Confirmed from
+         * {@code SportHealthQuery.paramUnpack} in the host dex: table 1009 (the minute detail
+         * table) is read with {@code setGroupUnitType(4)} and 1005 with {@code 8}. Without this
+         * the host applies its own default aggregation and a day of minute rows comes back as a
+         * handful of buckets, so a per-minute write cannot be confirmed by reading it back.
+         */
+        static final int GROUP_UNIT_DETAIL = 4;
+
+        /** A raw row read. {@code sportMode} is required for tables the library filters by mode. */
+        List<?> readRows(Object api, String account, int table, String device, long start, long end,
+                int groupUnit, boolean parse, int limit, Integer sportMode) throws Exception {
             Object option = readConstructor.newInstance();
             readAccount.invoke(option, account);
             readStart.invoke(option, Math.max(0, start));
@@ -1022,18 +1059,20 @@ public final class OHealthHealthImportHook {
             readTable.invoke(option, table);
             if (device != null && !device.isBlank()) readDevice.invoke(option, device);
             Class<?> readClass = readConstructor.getDeclaringClass();
+            if (sportMode != null) {
+                readClass.getMethod("setReadSportMode", int.class).invoke(option, sportMode);
+            }
             if (groupUnit != 0) {
                 readClass.getMethod("setGroupUnitType", int.class).invoke(option, groupUnit);
-                readClass.getMethod("setCount", int.class).invoke(option, 1);
-                readClass.getMethod("setSortOrder", int.class).invoke(option, 1);
             }
             if (limit > 0) readClass.getMethod("setCount", int.class).invoke(option, limit);
+            if (groupUnit != 0) readClass.getMethod("setSortOrder", int.class).invoke(option, 1);
             if (parse) {
                 try {
                     readClass.getMethod("setIsParse", int.class).invoke(option, 2);
                 } catch (NoSuchMethodException ignored) { }
             }
-            Object bean = awaitRead(read.invoke(api, option));
+            Object bean = awaitRead(api, option);
             if (!beanClass.isInstance(bean)) throw new IllegalStateException("IMPORT_READ_BEAN_TYPE");
             int code = (Integer) errorCode.invoke(bean);
             if (code == 101005) return List.of();
@@ -1056,7 +1095,7 @@ public final class OHealthHealthImportHook {
             Class<?> readClass = readConstructor.getDeclaringClass();
             readClass.getMethod("setReadSportMode", int.class).invoke(option, sportMode);
             readClass.getMethod("setSortOrder", int.class).invoke(option, 1);
-            Object bean = awaitRead(read.invoke(api, option));
+            Object bean = awaitRead(api, option);
             if (!beanClass.isInstance(bean)) throw new IllegalStateException("IMPORT_READ_BEAN_TYPE");
             int code = (Integer) errorCode.invoke(bean);
             if (code == 101005) return List.of();
@@ -1083,7 +1122,7 @@ public final class OHealthHealthImportHook {
             readTable.invoke(option, model.kind.table);
             readDevice.invoke(option, OHealthDeviceHook.healthId(records.get(0).deviceId));
             readType.invoke(option, -1);
-            Object bean = awaitRead(read.invoke(api, option));
+            Object bean = awaitRead(api, option);
             if (!beanClass.isInstance(bean)) throw new IllegalStateException("IMPORT_READ_BEAN_TYPE");
             int code = (Integer) errorCode.invoke(bean);
             if (code == 101005) return Set.of();
@@ -1095,10 +1134,81 @@ public final class OHealthHealthImportHook {
             return result;
         }
 
-        private Object awaitRead(Object observable) throws Exception {
+        /**
+         * Runs one blocking host call off the import worker, with a deadline.
+         *
+         * <p>Insert and delete go through the same health database service as a read and can stall
+         * the same way. Chart rebuild deletes the day's minute rows before writing them, so a
+         * stalled delete used to wedge the whole import on a device's first pass.</p>
+         */
+        private void dispatchHost(Runnable body) {
+            if (readStalls.get() >= 3) throw new IllegalStateException("IMPORT_READ_STALLED_OUT");
+            java.util.concurrent.ExecutorService pool = reader;
+            if (pool == null) {
+                pool = java.util.concurrent.Executors.newSingleThreadExecutor(runnable -> {
+                    Thread thread = new Thread(runnable, "OplusBandHostCall");
+                    thread.setDaemon(true);
+                    return thread;
+                });
+                reader = pool;
+            }
+            CountDownLatch done = new CountDownLatch(1);
+            AtomicReference<Throwable> boom = new AtomicReference<>();
+            pool.submit(() -> {
+                try {
+                    body.run();
+                } catch (Throwable failure) {
+                    boom.set(failure);
+                } finally {
+                    done.countDown();
+                }
+            });
+            boolean ok;
+            try {
+                ok = done.await(30, TimeUnit.SECONDS);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("IMPORT_CALL_INTERRUPTED");
+            }
+            if (!ok) {
+                // The dispatch thread is parked in a binder call. Leave it behind and give the
+                // next pass a fresh one.
+                readStalls.incrementAndGet();
+                reader = null;
+                throw new IllegalStateException("IMPORT_CALL_STALLED");
+            }
+            Throwable failure = boom.get();
+            if (failure == null) return;
+            if (failure instanceof RuntimeException runtime) throw runtime;
+            if (failure instanceof Error error) throw error;
+            throw new IllegalStateException(failure);
+        }
+
+        /**
+         * One host read, with a deadline.
+         *
+         * <p>{@code readSportHealthData} is a binder call into the health database service. While
+         * that service is still binding the call blocks with no timeout of its own, which wedged
+         * the import worker for the entire process lifetime: no steps, no sleep, no heart rate
+         * after the first pass. Dispatch it on a throwaway thread and abandon it on a stall, so a
+         * later pass can still succeed once the service is up. At most three stuck threads are
+         * abandoned per process; after that reads stop instead of leaking threads forever.</p>
+         */
+        private Object awaitRead(Object api, Object option) throws Exception {
+            if (readStalls.get() >= 3) throw new IllegalStateException("IMPORT_READ_STALLED_OUT");
+            java.util.concurrent.ExecutorService pool = reader;
+            if (pool == null) {
+                pool = java.util.concurrent.Executors.newSingleThreadExecutor(runnable -> {
+                    Thread thread = new Thread(runnable, "OplusBandRead");
+                    thread.setDaemon(true);
+                    return thread;
+                });
+                reader = pool;
+            }
             CountDownLatch done = new CountDownLatch(1);
             AtomicReference<Object> bean = new AtomicReference<>();
             AtomicReference<Object> disposable = new AtomicReference<>();
+            AtomicReference<Throwable> boom = new AtomicReference<>();
             AtomicBoolean failed = new AtomicBoolean();
             AtomicBoolean closed = new AtomicBoolean();
             Object observer = Proxy.newProxyInstance(loader, new Class<?>[]{observerClass}, (proxy, method, args) -> {
@@ -1117,9 +1227,32 @@ public final class OHealthHealthImportHook {
                 }
                 return null;
             });
+            java.util.concurrent.ExecutorService active = pool;
+            active.submit(() -> {
+                try {
+                    subscribe.invoke(read.invoke(api, option), observer);
+                } catch (Throwable failure) {
+                    boom.set(failure);
+                    done.countDown();
+                }
+            });
+            boolean ok;
             try {
-                subscribe.invoke(observable, observer);
-                if (!done.await(60, TimeUnit.SECONDS) || failed.get() || bean.get() == null) {
+                ok = done.await(30, TimeUnit.SECONDS);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("IMPORT_READ_INTERRUPTED");
+            }
+            if (!ok) {
+                // The dispatch thread is parked in a binder call. Leave it behind and give the
+                // next pass a fresh one.
+                readStalls.incrementAndGet();
+                reader = null;
+                throw new IllegalStateException("IMPORT_READ_STALLED");
+            }
+            try {
+                if (boom.get() != null) throw new IllegalStateException("IMPORT_READ_FAILED", boom.get());
+                if (failed.get() || bean.get() == null) {
                     throw new IllegalStateException("IMPORT_READ_UNCONFIRMED");
                 }
                 return bean.get();

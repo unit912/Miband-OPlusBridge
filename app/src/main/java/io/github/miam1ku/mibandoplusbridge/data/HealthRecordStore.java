@@ -549,6 +549,40 @@ public final class HealthRecordStore extends SQLiteOpenHelper {
         return changed;
     }
 
+    /**
+     * 删掉一个设备一个 kind 在 [startMs, endMs) 内的全部记录。
+     *
+     * <p>队列里每份测量同时写在 {@code measurements}（宿主查询的来源）与
+     * {@code revisions}（去重账本），两处都删才算干净 —— 只删 measurements
+     * 的话，revisions 里的指纹会让同一条记录再写不进去。
+     */
+    public synchronized int purgeWindow(String deviceId, String kind, long startMs, long endMs) {
+        if (deviceId == null || deviceId.isBlank() || kind == null || kind.isBlank()) return 0;
+        SQLiteDatabase db = getWritableDatabase();
+        String account = requireConfirmedAccount(db);
+        List<String> ids = new ArrayList<>();
+        try (Cursor rows = db.rawQuery("SELECT record_id FROM measurements WHERE account_hash=? "
+                + "AND device_id=? AND kind=? AND start_ms<? AND end_ms>?",
+                new String[] {account, deviceId, kind, Long.toString(endMs), Long.toString(startMs)})) {
+            while (rows.moveToNext()) ids.add(rows.getString(0));
+        }
+        int removed = 0;
+        db.beginTransaction();
+        try {
+            for (String id : ids) {
+                String[] key = {account, id};
+                // measurements（宿主读的来源）与 revisions（去重账本）都要删。
+                removed += db.delete("measurements", "account_hash=? AND record_id=?", key);
+                db.delete("revisions", "account_hash=? AND record_id=?", key);
+                db.delete("records", "account_hash=? AND record_id=?", key);
+            }
+            db.setTransactionSuccessful();
+        } finally {
+            db.endTransaction();
+        }
+        return removed;
+    }
+
     public record StressGap(String deviceId, long startMs, long endMs) {}
 
     /** Continuous stress 0 is an empty minute, not a reading. Ranges are [start, end). */

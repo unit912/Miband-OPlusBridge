@@ -33,6 +33,8 @@ public final class OHealthDeviceHook {
 
     private static volatile Bundle snapshot;
     private static volatile String remembered;
+    /** 快照循环的周期重查间隔：健康卡的 WatchProvider 行异步发布，只能靠低频重扫兜底。 */
+    private static final long REFRESH_INTERVAL_MS = 60_000L;
     private static int snapshotAttempts;
     private static boolean snapshotTraced;
 
@@ -225,6 +227,9 @@ public final class OHealthDeviceHook {
         worker = new Handler(thread.getLooper());
         Runnable[] refresh = new Runnable[1];
         refresh[0] = () -> {
+            // 先撤掉自己可能积压的下一次计划： provider 变更（observer）与 2s 重试都会
+            // 再排，这里统一收敛成「跑一次只排一个下一次」，避免 60s 心跳叠加。
+            worker.removeCallbacks(refresh[0]);
             Bundle result = fromProvider();
             main.post(() -> {
                 Bundle previous = snapshot;
@@ -256,6 +261,11 @@ public final class OHealthDeviceHook {
                 snapshotAttempts++;
                 worker.postDelayed(refresh[0], 2_000);
             } else snapshotAttempts = 0;
+            // 周期重查：健康卡在 WatchProvider 里的行是异步发布的（进程起来、数据落库
+            // 之后才出现），只靠桥接 provider 变更驱动的话，早先一次查不到就永远不 yield，
+            // 设备空间和快捷面板各留一块表。每 60s 无条件重跑一次，健康卡一上线，
+            // 下一轮就把桥接卡片让出去（onDeviceRemoved 由设备空间观察者执行）。
+            worker.postDelayed(refresh[0], REFRESH_INTERVAL_MS);
         };
         ContentObserver observer = new ContentObserver(worker) {
             @Override public void onChange(boolean selfChange) {
@@ -376,9 +386,17 @@ public final class OHealthDeviceHook {
 
     private static Object deviceInfo(ClassLoader loader, Bundle display) throws Exception {
         Class<?> constants = XposedHelpers.findClass(CONSTANTS, loader);
-        // Native pages only load for an OPPO band model. The Xiaomi MAC and device id stay real.
-        String model = (String) XposedHelpers.getStaticObjectField(constants, "BAND_DEVICE_MODEL");
+        // 展示模型：一加手表 W301CN（DEVICETYPE_TO_MODELS 里 type=3，圆表，
+        // 视觉上最接近华为 GT3）。上游经验是「OPPO band 模型才能加载原生页面」，
+        // 但那是小米手环项目的取舍；华为侧的 category/sport-mode 都由桥接自己
+        // 的 BandCatalog(modelId=huawei.watch.gt3) 决定，与这里的展示模型无关。
+        // 若手表模型导致设备页异常，回退 BAND_DEVICE_MODEL 即可。
+        String model = "W301CN";
         int type = wearableType(constants, model);
+        if (type < 0) {
+            model = (String) XposedHelpers.getStaticObjectField(constants, "BAND_DEVICE_MODEL");
+            type = wearableType(constants, model);
+        }
         if (type < 0 || model == null || model.isBlank()) {
             HookRuntime.log("OHEALTH_DEVICE_TYPE_MISSING");
             return null;
@@ -413,6 +431,17 @@ public final class OHealthDeviceHook {
 
     private static void updateInfo(Object info, Bundle shown) {
         XposedHelpers.callMethod(info, "setDeviceName", shown.getString("name", ""));
+        // 展示模型升级（手环 → 手表）后，把已入库的旧模型也刷成新值，
+        // 否则设备页继续按旧模型渲染产品图。只作用于 matches() 命中的
+        // 我们自己的设备。
+        try {
+            Class<?> constants = XposedHelpers.findClass(CONSTANTS, info.getClass().getClassLoader());
+            String watchModel = "W301CN";
+            if (wearableType(constants, watchModel) >= 0) {
+                XposedHelpers.callMethod(info, "setModel", watchModel);
+                XposedHelpers.callMethod(info, "setDeviceType", wearableType(constants, watchModel));
+            }
+        } catch (Throwable ignored) { }
         int battery = shown.getInt("battery", -1);
         XposedHelpers.callMethod(info, "setCapacityPercent", battery >= 0 && battery <= 100 ? battery : -1);
         XposedHelpers.callMethod(info, "setConnectionState", shown.getBoolean("connected") ? 102 : 103);
@@ -1010,8 +1039,6 @@ public final class OHealthDeviceHook {
     }
 
     private static volatile Boolean yielded;
-    private static int pushedBattery = Integer.MIN_VALUE;
-    private static boolean pushedConnected;
 
     /** Hide the bridge card only while health's own device-space row is still there. */
     private static void dropDuplicateSpaceCard(ClassLoader loader) {
@@ -1019,11 +1046,7 @@ public final class OHealthDeviceHook {
         if (shown == null || hostContext == null) return;
         boolean registered = shown.getBoolean("registered", false);
         String mac = shown.getString("mac", "");
-        boolean present = registered && !mac.isBlank() && healthCardPresent(mac);
-        if (present) refreshHealthCard(loader, mac, shown);
-        else {
-            pushedBattery = Integer.MIN_VALUE;
-        }
+        boolean present = registered && !mac.isBlank() && healthCardPresent(loader, mac);
         if (yielded != null && yielded == present) return;
         try {
             Bundle extras = new Bundle();
@@ -1037,51 +1060,38 @@ public final class OHealthDeviceHook {
         }
     }
 
-    private static boolean healthCardPresent(String mac) {
-        String id = healthCardId(mac);
-        if (id.isEmpty()) return false;
-        android.net.Uri uri = android.net.Uri.parse(
-                "content://com.heytap.health.WatchProvider/device_info_table_new");
-        try (android.database.Cursor cursor = hostContext.getContentResolver().query(
-                uri, new String[] {"device_id"}, "device_id=?", new String[] {id}, null)) {
-            return cursor != null && cursor.moveToFirst() && id.equals(cursor.getString(0));
+    /**
+     * Health's card for this band. The bridge card lives in another process, so this lookup only sees Health's row.
+     *
+     * <p>权威信号是健康 App 自己的绑定设备库：设备空间里那张「健康卡」由 Health 的
+     * WatchProvider 按账号绑定列表发布（卡片 id = MAC 的 MD5，小写 hex）。
+     * 早先查 mydevices 的 SDK 设备表（{@code DeviceInfoManager.queryDeviceById}）是错的——
+     * 那张表只收 SDK 自己 register 过的设备，健康卡走 provider-action 聚合，永远查不到，
+     * yield 因此从不触发，设备空间和快捷面板各留一块表。
+     * {@code DMLocalDeviceManager.INSTANCE.getUserBoundDeviceListByMac(mac)} 与 rememberBand 的
+     * {@code saveUserBoundDevice} 是同一个库，同步可读；用户在健康 App 里解绑会同步消失，
+     * 两个方向都正确。健康 App 自己查找失配时会打 {@code DMLocalDeviceManager: getUserBoundDeviceListByMac not find}。
+     */
+    private static volatile Boolean boundSeen;
+
+    private static boolean healthCardPresent(ClassLoader loader, String mac) {
+        try {
+            Class<?> local = XposedHelpers.findClass(
+                    "com.heytap.health.devicemanagerimpl.processor.DMLocalDeviceManager", loader);
+            Object instance = local.getField("INSTANCE").get(null);
+            Object bound = local.getMethod("getUserBoundDeviceListByMac", String.class)
+                    .invoke(instance, mac);
+            // 只在翻转时记一行：绑定库增删这台表（用户在健康 App 里绑定/解绑）会改变
+            // yield 方向，是排障时最想看到的信号；常态静默避免每轮刷新都刷屏。
+            if (boundSeen == null || boundSeen != (bound != null)) {
+                boundSeen = bound != null;
+                HookRuntime.log("DEVICE_SPACE_BOUND mac=" + mac + " found=" + boundSeen);
+            }
+            return bound != null;
         } catch (Throwable failure) {
-            HookRuntime.log("DEVICE_SPACE_LOOKUP_UNAVAILABLE "
+            HookRuntime.log("DEVICE_SPACE_BOUND_UNAVAILABLE "
                     + failure.getClass().getSimpleName());
             return false;
-        }
-    }
-
-    private static void refreshHealthCard(ClassLoader loader, String mac, Bundle shown) {
-        boolean connected = shown.getBoolean("connected");
-        int battery = shown.getInt("battery", -1);
-        if (pushedBattery == battery && pushedConnected == connected) return;
-        try {
-            Class<?> managerType = XposedHelpers.findClass(
-                    "com.oplus.mydevices.sdk.DeviceInfoManager", loader);
-            Object manager = XposedHelpers.callStaticMethod(managerType, "getInstance");
-            Object info = XposedHelpers.callMethod(manager, "queryDeviceById", healthCardId(mac));
-            if (info == null) return;
-            patchSdkDevice(info, shown);
-            XposedHelpers.callMethod(manager, "update", info);
-            pushedBattery = battery;
-            pushedConnected = connected;
-        } catch (Throwable failure) {
-            HookRuntime.log("DEVICE_SPACE_REFRESH_UNAVAILABLE "
-                    + failure.getClass().getSimpleName());
-        }
-    }
-
-    /** The device-space card id is the MD5 of the MAC text. The string is hashed as given, so the caller supplies uppercase colon form. */
-    private static String healthCardId(String mac) {
-        try {
-            byte[] digest = java.security.MessageDigest.getInstance("MD5")
-                    .digest(mac.getBytes(java.nio.charset.StandardCharsets.UTF_8));
-            StringBuilder hex = new StringBuilder(digest.length * 2);
-            for (byte value : digest) hex.append(String.format(java.util.Locale.US, "%02x", value & 0xff));
-            return hex.toString();
-        } catch (java.security.NoSuchAlgorithmException missing) {
-            return "";
         }
     }
 
@@ -1821,10 +1831,24 @@ public final class OHealthDeviceHook {
 
 
 
+    /** 型号→类型表的 dump 只做一次（诊断用：为华为手表挑一个正确的展示模型）。 */
+    private static boolean typeMapDumped;
+
     private static int wearableType(Class<?> constants, String model) {
         Object companion = XposedHelpers.getStaticObjectField(constants, "Companion");
         Object mapped = XposedHelpers.callMethod(companion, "getDEVICETYPE_TO_MODELS");
         if (!(mapped instanceof Map<?, ?> types)) return -1;
+        if (!typeMapDumped) {
+            typeMapDumped = true;
+            for (Map.Entry<?, ?> entry : types.entrySet()) {
+                StringBuilder models = new StringBuilder();
+                appendModels(models, entry.getValue());
+                // 每个类型一行：type=2 等是手表还是手环，models 是该类型下的全部
+                // 模型串 —— 换展示模型（修设备页图片）就从这里挑。
+                HookRuntime.log("OHEALTH_DEVICE_TYPE_MAP type=" + entry.getKey()
+                        + " models=" + models);
+            }
+        }
         for (Map.Entry<?, ?> entry : types.entrySet()) {
             if (containsModel(entry.getValue(), model) && entry.getKey() instanceof Number type) return type.intValue();
         }
@@ -1836,6 +1860,17 @@ public final class OHealthDeviceHook {
             for (Object child : values) if (containsModel(child, model)) return true;
         }
         return false;
+    }
+
+    private static void appendModels(StringBuilder out, Object value) {
+        if (value instanceof String text) {
+            if (out.length() > 0) out.append(',');
+            out.append(text);
+            return;
+        }
+        if (value instanceof Collection<?> values) {
+            for (Object child : values) appendModels(out, child);
+        }
     }
 
 }

@@ -13,3 +13,8 @@ HANDOFF.md
 __pycache__/
 *.pyc
 tools/
+
+# 本地工具链与工作目录（不入库）
+work/
+scripts/_javac_out/
+*.log

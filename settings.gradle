@@ -6,7 +6,17 @@ pluginManagement {
     }
 }
 dependencyResolutionManagement {
-    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    // 用 PREFER_PROJECT 而非 FAIL_ON_PROJECT_REPOS。
+    //
+    // %USERPROFILE%\.gradle\init.gradle 用 allprojects{repositories{...}} 注入了
+    // 阿里云镜像，而 FAIL_ON_PROJECT_REPOS 规定「项目级仓库声明一律报错」——
+    // 任何经 init 脚本注入的仓库都会让构建直接失败：
+    //   Build was configured to prefer settings repositories over project
+    //   repositories but repository 'maven' was added by initialization script
+    //
+    // PREFER_PROJECT 允许项目级仓库存在，同时仍优先用 settings 里声明的仓库，
+    // 镜像与离线缓存都能正常工作。全局 init.gradle 是用户有意配置，不去动它。
+    repositoriesMode.set(RepositoriesMode.PREFER_PROJECT)
     repositories {
         google()
         mavenCentral()
@@ -14,3 +24,5 @@ dependencyResolutionManagement {
 }
 rootProject.name = 'mi-band11-oplus13'
 include ':app'
+// 离线握手自检 APK：独立 applicationId，按路径复用 :app 的 huawei 协议源码。
+include ':probe'

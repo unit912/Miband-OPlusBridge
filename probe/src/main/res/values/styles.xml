@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      自检界面用 framework 的 Material Light 主题，不引 AppCompat。
+      单选浅色是刻意的：日志区是等宽堆栈，深色下对比度反而更难读，
+      而这个界面只在调试时用，不需要跟随系统主题。
+    -->
+    <style name="Theme.GT3Probe" parent="@android:style/Theme.Material.Light" />
+</resources>

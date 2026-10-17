@@ -47,11 +47,15 @@ public final class OHealthStepWriterTest {
         assertEquals(0, OHealthStepWriter.groupSportType(3));
     }
 
-    @Test public void publishStepsOnlyWhenTheBandIsAhead() {
+    @Test public void publishStepsWheneverTheWatchReportsAPlausibleTotal() {
         assertTrue(OHealthStepWriter.publishSteps(0, 100));
-        assertFalse(OHealthStepWriter.publishSteps(200, 100));
+        // The watch is authoritative: it replaces the cache even when the phone sensor is ahead,
+        // otherwise the card freezes on the phone's own count and reads as "no longer syncing".
+        assertTrue(OHealthStepWriter.publishSteps(200, 100));
+        assertTrue(OHealthStepWriter.publishSteps(100, 100));
         assertFalse(OHealthStepWriter.publishSteps(0, 0));
-        assertFalse(OHealthStepWriter.publishSteps(100, 100));
+        assertFalse(OHealthStepWriter.publishSteps(0, -1));
+        assertFalse(OHealthStepWriter.publishSteps(0, 200_001L));
     }
 
     private static HealthRecord minute(long dayStart, int index, int steps, Integer calories, Integer distance) {

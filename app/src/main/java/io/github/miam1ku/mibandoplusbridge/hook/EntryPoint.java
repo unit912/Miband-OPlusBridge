@@ -270,6 +270,27 @@ public final class EntryPoint extends XposedModule {
         } catch (Throwable incompatible) {
             probe("OHEALTH_SLEEP_HOOK_UNAVAILABLE");
         }
+        // 一次性维护：桥接侧写了睡眠清理窗口时，按当前设备执行一次删除。
+        // 放在钩子集装完之后 —— 这时 band-state 才读得到 deviceId。
+        try {
+            android.os.Bundle band = OHealthDeviceHook.registeredSnapshot();
+            String bridgeId = band == null ? "" : band.getString("deviceId", "");
+            if (bridgeId.isBlank()) {
+                probe("OHEALTH_SLEEP_CLEANUP_IDLE band=" + (band == null ? "null" : "blank"));
+            } else {
+                String device = OHealthDeviceHook.healthId(bridgeId);
+                new Thread(() -> {
+                    try {
+                        int removed = OHealthSleepCleanup.run(context, device);
+                        if (removed < 0) probe("OHEALTH_SLEEP_CLEANUP_IDLE no plan");
+                    } catch (Throwable failure) {
+                        probe("OHEALTH_SLEEP_CLEANUP_FAILED " + failure);
+                    }
+                }, "OplusBandSleepCleanup").start();
+            }
+        } catch (Throwable incompatible) {
+            probe("OHEALTH_SLEEP_CLEANUP_UNAVAILABLE " + incompatible);
+        }
         try {
             OHealthHomeMetricHook.install(context, loader);
             probe("OHEALTH_HOME_METRIC_HOOK_INSTALLED");

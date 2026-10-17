@@ -1,0 +1,38 @@
+// 项目本地的构建加速/兼容脚本。
+//
+// 为什么需要它
+// ------------
+// 你在 %USERPROFILE%\.gradle\init.gradle 里配了阿里云镜像（加速依赖下载），
+// 它用 `allprojects { repositories { ... } }` 注入仓库。而 bridge 的
+// settings.gradle 声明了：
+//
+//     dependencyResolutionManagement {
+//         repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+//     }
+//
+// 这两个策略直接冲突：FAIL_ON_PROJECT_REPOS 表示"项目级仓库声明一律报错"。
+// 于是任何通过 allprojects 注入仓库的 init 脚本都会让构建失败：
+//
+//     Build was configured to prefer settings repositories over project
+//     repositories but repository 'maven' was added by initialization script
+//
+// 全局 init.gradle 不动（那是你有意配置的镜像）。这里用
+// `settingsEvaluated` 把镜像加到 settings 级仓库列表里 —— 语义上等价于
+// 全局 init 想做的事，但不违反 FAIL_ON_PROJECT_REPOS。
+
+def mirrors = [
+        'https://maven.aliyun.com/repository/google',
+        'https://maven.aliyun.com/repository/central',
+        'https://maven.aliyun.com/repository/gradle-plugin',
+        'https://maven.aliyun.com/repository/public',
+]
+
+settingsEvaluated { settings ->
+    settings.pluginManagement.repositories {
+        mirrors.each { u -> maven { url u } }
+        gradlePluginPortal()
+    }
+    settings.dependencyResolutionManagement.repositories {
+        mirrors.each { u -> maven { url u } }
+    }
+}

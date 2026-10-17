@@ -72,9 +72,20 @@ final class OHealthLockCardHook {
         }
     }
 
-    static long stepToShow(long shown, long band) {
+    /**
+     * The watch is the authoritative step source, so its day total replaces the shown value.
+     * A total from before midnight is yesterday's and must not leak onto a new day's card, so
+     * stale snapshots fall back to what the cache already shows.
+     */
+    static long stepToShow(long shown, long band, long bandAt) {
         if (band <= 0 || band > 200_000L) return shown;
-        return Math.max(shown, band);
+        if (bandAt < todayStartMs()) return shown;
+        return band;
+    }
+
+    private static long todayStartMs() {
+        return java.time.LocalDate.now().atStartOfDay(java.time.ZoneId.systemDefault())
+                .toInstant().toEpochMilli();
     }
 
     private static Bundle band() {
@@ -120,7 +131,7 @@ final class OHealthLockCardHook {
         int index = original.getColumnIndex("step");
         if (index < 0) return rewind(original);
         long shown = readLong(original, index);
-        long next = stepToShow(shown, band.getLong("stepsToday", -1));
+        long next = stepToShow(shown, band.getLong("stepsToday", -1), band.getLong("stepsAtMs", 0));
         if (next == shown) return rewind(original);
         String[] names = original.getColumnNames();
         MatrixCursor out = new MatrixCursor(names, original.getCount());
