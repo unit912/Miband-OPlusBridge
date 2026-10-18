@@ -53,7 +53,6 @@ public final class MyDevicesHook {
         hookIconPackage(hostLoader);
         hookPlaceholderIcon(context, hostLoader);
         if (!"com.heytap.mydevices".equals(process)) return;
-        traceScanner(hostLoader);
         Class<?> deviceApp = Class.forName("com.oplus.mydevices.domain.entities.config.DeviceApp", false, hostLoader);
         Class<?> deletion = Class.forName("com.oplus.mydevices.domain.entities.config.DelDeviceMethod", false, hostLoader);
         // Min app and OS versions stay 0. Build 17.4 filters on the installed versionCode and ColorOS version, so a pinned 36 drops the card on a newer OS.
@@ -63,26 +62,6 @@ public final class MyDevicesHook {
                         true, true, Boolean.TRUE, deletion.getField("NONE").get(null));
         Method packageName = deviceApp.getMethod("getPackageName");
         Class<?> manager = Class.forName(MANAGER, false, hostLoader);
-        // ★ 2026-10-18：queryAppConfig 是 scanner 按 packageName 查 DeviceApp 的真正入口
-        // （Manager.a(String)）。include hook 只改 cacheList(j) 的返回值，宿主自身的
-        // configCache lazy 可能持原始引用，scanner 查询仍不中 → device input 收到
-        // 完整 DeviceInfo 后被静默丢弃。这里对 a() 直接兜底：查我们时永远返回 app。
-        for (Method query : manager.getDeclaredMethods()) {
-            if (Modifier.isStatic(query.getModifiers())
-                    || query.getParameterCount() != 1
-                    || query.getParameterTypes()[0] != String.class
-                    || !deviceApp.isAssignableFrom(query.getReturnType())) continue;
-            XposedBridge.hookMethod(query, new XC_MethodHook() {
-                @Override protected void afterHookedMethod(MethodHookParam param) {
-                    if (param.hasThrowable()) return;
-                    if (!PACKAGE.equals(param.args[0])) return;
-                    if (param.getResult() != null) return;
-                    param.setResult(app);
-                    HookRuntime.log("DEVICE_APP_QUERY_FED method="
-                            + query.getName());
-                }
-            });
-        }
         Class<?> agent = Class.forName(APP_AGENT, false, hostLoader);
         Method cache = cacheList(manager);
         Method support = method(manager, "getSupportDeviceApplications");
@@ -106,8 +85,6 @@ public final class MyDevicesHook {
                 }
                 if (!present) copy.add(app);
                 param.setResult(copy);
-                HookRuntime.log("DEVICE_APP_INCLUDE cache=" + cache
-                        + " wasPresent=" + present + " size=" + copy.size());
             }
         };
         XposedBridge.hookMethod(cache, include);
@@ -248,45 +225,6 @@ public final class MyDevicesHook {
      * A control-center tap ends in {@code startActivity}. The redirect matches the detail action and the band id,
      * then points the intent at the Health panel registered for that action, so one build's obfuscated class is not pinned.
      */
-    /**
-     * 2026-10-18 排障：scanner 收到 device input 后 UI 不建卡，把 scanner 与
-     * DevicesManager 的所有实例方法调用打出来，定位丢弃点。定位后移除。
-     */
-    private static void traceScanner(ClassLoader loader) {
-        String[] types = {
-                "com.heytap.mydevices.core.device.DeviceAppScannerImpl",
-                "com.heytap.mydevices.core.device.DevicesManager",
-        };
-        for (String type : types) {
-            Class<?> cls;
-            try {
-                cls = Class.forName(type, false, loader);
-            } catch (Throwable missing) {
-                HookRuntime.log("DEVICE_TRACE_UNAVAILABLE " + type);
-                continue;
-            }
-            String simple = type.substring(type.lastIndexOf('.') + 1);
-            for (java.lang.reflect.Method m : cls.getDeclaredMethods()) {
-                if (m.isSynthetic() || "<init>".equals(m.getName())) continue;
-                try {
-                    XposedBridge.hookMethod(m, new XC_MethodHook() {
-                        @Override protected void afterHookedMethod(MethodHookParam param) {
-                            if (param.hasThrowable()) return;
-                            Object result = param.getResult();
-                            String brief = result == null ? "void"
-                                    : result instanceof java.util.List<?> l ? "list[" + l.size() + "]"
-                                    : String.valueOf(result);
-                            if (brief.length() > 120) brief = brief.substring(0, 120);
-                            HookRuntime.log("TRACE " + simple + "." + m.getName()
-                                    + " -> " + brief);
-                        }
-                    });
-                } catch (Throwable ignored) { }
-            }
-        }
-        HookRuntime.log("DEVICE_TRACE_INSTALLED");
-    }
-
     private static void hookDetailJump(Context context) {
         XposedBridge.hookAllMethods(Instrumentation.class, "execStartActivity", new XC_MethodHook() {
             @Override protected void beforeHookedMethod(MethodHookParam param) {
@@ -495,24 +433,16 @@ public final class MyDevicesHook {
             refresh(false);
         }
 
+        /**
+         * 同步一次卡片行。{@code force} 时即使本世代已发布过同一 id 也重新
+         * {@code added}：宿主静默丢卡后只有 add 能把它找回来，{@code updated}
+         * 只在卡还在时刷新内容，救不活已经丢掉的卡。
+         */
         void refresh(boolean force) {
             if (active != this) return;
-            // ★ 2026-10-18：健康卡行存在时优先走健康卡 id —— 设备空间 UI 只认
-            // health authority 的行（桥接 DEVICE_APP 源的行会被 UI 过滤掉，
-            // 实测 DevicesManager list[4] 但 UI 只渲染 3）。健康表行由
-            // bridgeWatchfacePublisher 维护（见 OHealthDeviceHook）。
-            Snapshot health = healthRowSnapshot();
-            if (health != null) {
-                HookRuntime.log("DEVICE_CARD_HEALTH_ROW id=" + health.id());
-                addOrUpdate(health, force);
-                return;
-            }
             try (Cursor cursor = context.getContentResolver().query(DeviceCardProvider.URI,
                     new String[]{"device_id", "device_data"}, null, null, null)) {
-                if (cursor == null) {
-                    HookRuntime.log("DEVICE_CARD_REFRESH cursor=null");
-                    return;
-                }
+                if (cursor == null) return;
                 Snapshot now = null;
                 if (cursor.moveToFirst()) {
                     String id = cursor.getString(0);
@@ -520,47 +450,6 @@ public final class MyDevicesHook {
                         now = new Snapshot(id, new JSONObject(cursor.getString(1)).optLong("revision"));
                     }
                 }
-                HookRuntime.log("DEVICE_CARD_REFRESH force=" + force + " row=" + now);
-                if (active != this) return;
-                addOrUpdate(now, force);
-            } catch (Exception unavailable) {
-                HookRuntime.log("DEVICE_CARD_OBSERVER_UNAVAILABLE", unavailable);
-            }
-        }
-
-        /** 健康 WatchProvider 卡片表里这台表的行（无则 null）。 */
-        private Snapshot healthRowSnapshot() {
-            try (Cursor cursor = context.getContentResolver().query(
-                    android.net.Uri.parse(
-                            "content://com.heytap.health.WatchProvider/device_info_table_new"),
-                    new String[]{"device_id", "device_mac", "device_data"},
-                    "device_mac=?", new String[]{liveMac()}, null)) {
-                if (cursor == null || !cursor.moveToFirst()) return null;
-                String id = cursor.getString(0);
-                if (id == null || id.isBlank()) return null;
-                return new Snapshot(id, new JSONObject(cursor.getString(2)).optLong("revision"));
-            } catch (Throwable unavailable) {
-                return null;
-            }
-        }
-
-        private String liveMac() {
-            try {
-                android.os.Bundle display = context.getContentResolver().call(
-                        DeviceCardProvider.URI, "bandDisplay", null, null);
-                return display == null ? "" : display.getString("mac", "");
-            } catch (RuntimeException unavailable) {
-                return "";
-            }
-        }
-
-        /**
-         * 同步一次卡片行。{@code force} 时即使本世代已发布过同一 id 也重新
-         * {@code added}：宿主静默丢卡后只有 add 能把它找回来，{@code updated}
-         * 只在卡还在时刷新内容，救不活已经丢掉的卡。
-         */
-        private void addOrUpdate(Snapshot now, boolean force) {
-            try {
                 if (active != this) return;
                 Snapshot before = last;
                 // Hot reload drops this session. The host still shows the card the previous generation added.
@@ -579,11 +468,8 @@ public final class MyDevicesHook {
                     withdrawn = null;
                     HookRuntime.carry(CARRIED_CARD, now.id());
                     if (force || before == null || !before.id().equals(now.id())) {
-                        HookRuntime.log("DEVICE_CARD_ADD id=" + now.id());
                         added.invoke(observer, now.id());
-                        HookRuntime.log("DEVICE_CARD_ADD_OK");
                     } else if (before.revision() != now.revision()) {
-                        HookRuntime.log("DEVICE_CARD_UPDATE id=" + now.id());
                         updated.invoke(observer, now.id());
                     }
                 }
