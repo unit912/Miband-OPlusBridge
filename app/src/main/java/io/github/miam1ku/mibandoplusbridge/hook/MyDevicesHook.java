@@ -52,6 +52,12 @@ public final class MyDevicesHook {
         hookDetailJump(context);
         hookIconPackage(hostLoader);
         hookPlaceholderIcon(context, hostLoader);
+        // ★ 2026-10-21：设备空间的 UI 侧跑在 :cards 进程，那边的产品白名单
+        // （ProductWhiteListConfig.isValidProduct）会按包名把桥接这张卡剔掉。
+        // 白名单判定最终落到 DeviceAppConfigManager 的 (String)boolean 方法，
+        // 它读的是 manager 自己的 StateFlow，绕过了下面 cacheList 的 hook，
+        // 所以必须让 :cards 进程也装上这一段。
+        hookPackageSupport(hostLoader);
         if (!"com.heytap.mydevices".equals(process)) return;
         Class<?> deviceApp = Class.forName("com.oplus.mydevices.domain.entities.config.DeviceApp", false, hostLoader);
         Class<?> deletion = Class.forName("com.oplus.mydevices.domain.entities.config.DelDeviceMethod", false, hostLoader);
@@ -89,17 +95,6 @@ public final class MyDevicesHook {
         };
         XposedBridge.hookMethod(cache, include);
         if (support != null && !support.equals(cache)) XposedBridge.hookMethod(support, include);
-        // Membership is decided from this companion table. ColorOS 16 has two (String)boolean methods; 17 names them isSupport and isSupportDetailPanel.
-        for (Method method : manager.getDeclaredMethods()) {
-            if (Modifier.isStatic(method.getModifiers()) || method.getReturnType() != boolean.class) continue;
-            Class<?>[] params = method.getParameterTypes();
-            if (params.length != 1 || params[0] != String.class) continue;
-            XposedBridge.hookMethod(method, new XC_MethodHook() {
-                @Override protected void afterHookedMethod(MethodHookParam param) {
-                    if (!param.hasThrowable() && PACKAGE.equals(param.args[0])) param.setResult(Boolean.TRUE);
-                }
-            });
-        }
         // A hot reload stops the old observer thread. The host keeps the observer it already handed over,
         // so this generation resumes with that same observer.
         HookRuntime.track(MyDevicesHook::unregister);
@@ -126,6 +121,46 @@ public final class MyDevicesHook {
     }
 
     /** Device space reads this cache. The method is {@code j} on 16 and {@code f} on 17; the return type stayed. */
+    /**
+     * 让宿主把本桥接当作一个受支持的设备应用（包名白名单）。
+     *
+     * <p>设备空间首页在 {@code com.heytap.mydevices:cards} 进程渲染，那边
+     * {@code ProductWhiteListConfig.isValidProduct} 先问
+     * {@code DeviceAppConfigManager.c(packageName)}：这个方法遍历 manager 自己
+     * 持有的 StateFlow（{@code j()} → {@code d.getValue()}）找包名，
+     * <b>绕过了上面 cacheList 的 hook</b>，所以只在 cacheList 里塞自己不够，
+     * 判定会返回 false 并打出 {@code isValidProduct: not support app,pkg=...}，
+     * 这张卡随后被 UI 剔除（数据其实已经进了宿主库，UI 只渲染 3 个设备）。
+     *
+     * <p>小米链路没这个问题：小米运动健康是真实安装的应用，宿主配置里本来就有它；
+     * 桥接是自装应用，宿主配置永远不会自动收录。
+     *
+     * <p>ColorOS 16 有两个 (String)boolean 方法，17 命名为 isSupport / isSupportDetailPanel，
+     * 全部按签名匹配后一律对本包名返回 true。
+     */
+    private static void hookPackageSupport(ClassLoader hostLoader) {
+        try {
+            Class<?> manager = Class.forName(MANAGER, false, hostLoader);
+            int hooked = 0;
+            for (Method method : manager.getDeclaredMethods()) {
+                if (Modifier.isStatic(method.getModifiers()) || method.getReturnType() != boolean.class) continue;
+                Class<?>[] params = method.getParameterTypes();
+                if (params.length != 1 || params[0] != String.class) continue;
+                XposedBridge.hookMethod(method, new XC_MethodHook() {
+                    @Override protected void afterHookedMethod(MethodHookParam param) {
+                        if (!param.hasThrowable() && PACKAGE.equals(param.args[0])) param.setResult(Boolean.TRUE);
+                    }
+                });
+                hooked++;
+            }
+            HookRuntime.log("DEVICE_CARD_SUPPORT_HOOK " + hooked
+                    + " process=" + Application.getProcessName());
+        } catch (Throwable failure) {
+            HookRuntime.log("DEVICE_CARD_SUPPORT_HOOK_UNAVAILABLE "
+                    + failure.getClass().getSimpleName());
+        }
+    }
+
     private static Method cacheList(Class<?> manager) {
         Method found = null;
         for (Method method : manager.getDeclaredMethods()) {
