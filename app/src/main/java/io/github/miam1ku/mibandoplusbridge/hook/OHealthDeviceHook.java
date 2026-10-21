@@ -1071,27 +1071,171 @@ public final class OHealthDeviceHook {
      * {@code DMLocalDeviceManager.INSTANCE.getUserBoundDeviceListByMac(mac)} 与 rememberBand 的
      * {@code saveUserBoundDevice} 是同一个库，同步可读；用户在健康 App 里解绑会同步消失，
      * 两个方向都正确。健康 App 自己查找失配时会打 {@code DMLocalDeviceManager: getUserBoundDeviceListByMac not find}。
+     *
+     * <p>★ 2026-10-18 第一步修复：绑定库有条目 ≠ 卡片真的存在。健康 App 的
+     * {@code DeviceIdleDisableWork} 在每次健康进程启动时禁用 WatchProvider 并清空
+     * {@code device_info_v2.db}（实测整表 0 行），此后没有新的发布事件，
+     * mydevices 永远查不到健康卡。此时若仍按旧判定 yield=true，桥接卡让位后
+     * 两边都没有行 → 设备空间/负一屏的手表卡与磁贴整个消失（用户实测：
+     * 一开 OPPO 健康卡片就消失，关掉又回来）。
+     * 所以绑定库命中后必须再验一次卡片表里真有这台表的行，且 WatchProvider 组件处于启用态。
      */
     private static volatile Boolean boundSeen;
+    private static volatile Boolean rowSeen;
 
     private static boolean healthCardPresent(ClassLoader loader, String mac) {
+        boolean bound;
         try {
             Class<?> local = XposedHelpers.findClass(
                     "com.heytap.health.devicemanagerimpl.processor.DMLocalDeviceManager", loader);
             Object instance = local.getField("INSTANCE").get(null);
-            Object bound = local.getMethod("getUserBoundDeviceListByMac", String.class)
+            Object found = local.getMethod("getUserBoundDeviceListByMac", String.class)
                     .invoke(instance, mac);
+            bound = found != null;
             // 只在翻转时记一行：绑定库增删这台表（用户在健康 App 里绑定/解绑）会改变
             // yield 方向，是排障时最想看到的信号；常态静默避免每轮刷新都刷屏。
-            if (boundSeen == null || boundSeen != (bound != null)) {
-                boundSeen = bound != null;
+            if (boundSeen == null || boundSeen != bound) {
+                boundSeen = bound;
                 HookRuntime.log("DEVICE_SPACE_BOUND mac=" + mac + " found=" + boundSeen);
             }
-            return bound != null;
         } catch (Throwable failure) {
             HookRuntime.log("DEVICE_SPACE_BOUND_UNAVAILABLE "
                     + failure.getClass().getSimpleName());
             return false;
+        }
+        if (!bound) return false;
+        boolean row = healthCardRowExists(mac);
+        if (rowSeen == null || rowSeen != row) {
+            rowSeen = row;
+            HookRuntime.log("DEVICE_SPACE_HEALTH_ROW mac=" + mac + " present=" + rowSeen);
+        }
+        return row;
+    }
+
+    /**
+     * 健康 WatchProvider 的卡片表里真有这台表的行，且组件处于启用态。
+     *
+     * <p>两个条件都要：
+     * <ul>
+     *   <li><b>表里有行</b>——桥接的卡不能冒充健康卡，两者同 MAC 会让设备空间
+     *       （按 MAC 去重）把两张卡一起丢掉。</li>
+     *   <li><b>组件启用</b>——表里的行是上一次发布留下的残留，组件被
+     *       {@code DeviceIdleDisableWork} 禁用后行虽然还在，provider 不再对外提供，
+     *       mydevices 实际查不到。此时必须让桥接卡顶上。</li>
+     * </ul>
+     *
+     * <p>读法：hook 跑在健康 App 进程内，{@code hostContext} 就是健康 App 的 Context，
+     * 直接开它自己的 {@code device_info_v2.db} 读表最稳——不依赖 provider 组件是否启用，
+     * 也不会拿到被宿主脱敏（{@code device_mac} 列返回空串）的结果。
+     * 读不到时回退到 provider query，比对键只用 {@code device_id}（MAC 的 MD5）
+     * 与 {@code device_data} 里的 {@code mMacAddress}。
+     */
+    private static boolean healthCardRowExists(String mac) {
+        if (hostContext == null) return false;
+        if (!watchProviderEnabled()) return false;
+        if (healthRowInDatabase(mac)) return true;
+        return healthRowViaProvider(mac);
+    }
+
+    /** 组件是否处于启用态（被 DeviceIdleDisableWork 禁用时返回 false）。 */
+    private static boolean watchProviderEnabled() {
+        try {
+            android.content.pm.PackageManager manager = hostContext.getPackageManager();
+            android.content.ComponentName component = new android.content.ComponentName(
+                    "com.heytap.health", "com.heytap.health.linkage.watch.WatchProvider");
+            int state = manager.getComponentEnabledSetting(component);
+            if (state == android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_DISABLED
+                    || state == android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_DISABLED_USER
+                    || state == android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_DISABLED_UNTIL_USED) {
+                return false;
+            }
+            return true;
+        } catch (Throwable unavailable) {
+            return true;
+        }
+    }
+
+    /** 直接读健康 App 自己的卡片库（进程内读，provider 被禁用时也读得到）。 */
+    private static boolean healthRowInDatabase(String mac) {
+        try {
+            java.io.File file = hostContext.getDatabasePath("device_info_v2.db");
+            if (!file.isFile() || file.length() == 0) return false;
+            try (android.database.sqlite.SQLiteDatabase db =
+                         android.database.sqlite.SQLiteDatabase.openDatabase(
+                                 file.getPath(), null,
+                                 android.database.sqlite.SQLiteDatabase.OPEN_READONLY)) {
+                if (!tableExists(db)) return false;
+                try (android.database.Cursor cursor = db.query(
+                        "device_info_table_new", new String[]{"device_id", "device_data"},
+                        null, null, null, null, null)) {
+                    return cursor != null && scanRows(cursor, mac);
+                }
+            }
+        } catch (Throwable unavailable) {
+            return false;
+        }
+    }
+
+    private static boolean tableExists(android.database.sqlite.SQLiteDatabase db) {
+        try (android.database.Cursor cursor = db.rawQuery(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='device_info_table_new'",
+                null)) {
+            return cursor != null && cursor.moveToFirst();
+        } catch (Throwable unavailable) {
+            return false;
+        }
+    }
+
+    /** 回退：走 provider query（组件启用时有效）。 */
+    private static boolean healthRowViaProvider(String mac) {
+        try (android.database.Cursor cursor = hostContext.getContentResolver().query(
+                android.net.Uri.parse(
+                        "content://com.heytap.health.WatchProvider/device_info_table_new"),
+                new String[]{"device_id", "device_data"}, null, null, null)) {
+            return cursor != null && scanRows(cursor, mac);
+        } catch (Throwable unavailable) {
+            return false;
+        }
+    }
+
+    /**
+     * 逐行比对这台表。
+     *
+     * <p>比对键：{@code device_id}（健康 App 用 MAC 的 MD5 小写 hex 当卡片 id）
+     * 或 {@code device_data} 里的 {@code mMacAddress}。
+     * <b>不能用 {@code device_mac} 列</b>：宿主 provider 返回时该列被脱敏成空串，
+     * 拿它比对永远不命中（e09da25 的第二道验证就死在这里）。
+     */
+    private static boolean scanRows(android.database.Cursor cursor, String mac) {
+        String lower = mac.toLowerCase(java.util.Locale.ROOT);
+        String upper = mac.toUpperCase(java.util.Locale.ROOT);
+        String md5Lower = md5Lowercase(lower);
+        String md5Upper = md5Lowercase(upper);
+        while (cursor.moveToNext()) {
+            String id = cursor.getString(0);
+            if (id != null && (id.equalsIgnoreCase(md5Lower) || id.equalsIgnoreCase(md5Upper))) {
+                return true;
+            }
+            String data = cursor.getString(1);
+            if (data == null) continue;
+            if (data.contains("\"mMacAddress\":\"" + mac + "\"")
+                    || data.contains("\"mMacAddress\":\"" + lower + "\"")
+                    || data.contains("\"mMacAddress\":\"" + upper + "\"")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static String md5Lowercase(String text) {
+        try {
+            byte[] digest = java.security.MessageDigest.getInstance("MD5")
+                    .digest(text.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            StringBuilder hex = new StringBuilder(32);
+            for (byte b : digest) hex.append(String.format("%02x", b));
+            return hex.toString();
+        } catch (java.security.NoSuchAlgorithmException impossible) {
+            return text;
         }
     }
 
