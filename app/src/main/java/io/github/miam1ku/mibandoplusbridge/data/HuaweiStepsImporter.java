@@ -103,6 +103,11 @@ public final class HuaweiStepsImporter {
         SessionLog.line(context, "HUAWEI_STEPS_IMPORT minutes=" + steps
                 + " steps=" + total + " heart=" + heart + " oxygen=" + oxygen
                 + " purged=" + purged);
+        // 归档写完了，告诉宿主现在就来读。归档走的是直接写 SQLite 的
+        // enqueueMeasurement，不经过 provider 的 call()，那一路不发通知；
+        // 不补这一下，健康进程里的 ContentObserver 收不到，步数就一直
+        // 停在上一轮归档时的值。
+        io.github.miam1ku.mibandoplusbridge.integration.HealthQueueProvider.notifyArchived(context);
         return new Result(steps, heart, oxygen, purged);
     }
 

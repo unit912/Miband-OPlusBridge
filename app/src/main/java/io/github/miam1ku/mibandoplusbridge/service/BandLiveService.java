@@ -1734,16 +1734,23 @@ public final class BandLiveService extends Service {
         // 500ms 轮询一次 stopRequested —— CountDownLatch 没有条件等待，
         // 而停机指令来自主线程的 requestStop()，等待方必须及时醒。
         try {
-            // 每 500ms 醒一次，600 次 ≈ 5 分钟刷一次当日汇总。
+            // 每 500ms 醒一次，120 次 = 60 秒刷一次当日汇总。
             // 为什么轮询而不是等手表推：GT3 在认证后是静默的（实测握手完成后
             // 数分钟一帧不上报），步数只能靠主动问。
+            //
+            // 2026-10-21：原来这里是 600 次（5 分钟），延迟全在那儿 ——
+            // 手表 16:08 已经是 1737 步，设备空间还停在 16:05 拉到的 1599，
+            // 差 138 步。一轮心跳实测 0.66 秒（totals → 心率 → 归档），
+            // 60 秒的间隔让 0x07 通道占用率不到 1%，比原来的 5 分钟快 5 倍。
+            // 同一通道的各段仍然是串行的：每段都在上一段的终态回调里发，
+            // 并发同通道链会让手表无声挂死（2026-10-14 实测教训）。
             long ticks = 0;
             while (!finished.await(500, TimeUnit.MILLISECONDS)) {
                 if (stopRequested) {
                     outcome[0] = "STOPPED";
                     break;
                 }
-                if (++ticks % 600 == 0 && provider.isAuthenticated()) {
+                if (++ticks % 120 == 0 && provider.isAuthenticated()) {
                     // 睡眠链卡死自愈：无声挂死（无终态回调）时强制复位，本轮
                     // 末尾的心率回调之后会自动重试睡眠拉取。
                     clearStuckSleepPull(provider);

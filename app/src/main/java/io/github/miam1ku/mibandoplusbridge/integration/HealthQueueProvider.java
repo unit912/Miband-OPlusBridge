@@ -26,6 +26,26 @@ public final class HealthQueueProvider extends ContentProvider {
     private String proposedFingerprint;
     private long proposedAtMs;
 
+    /**
+     * 归档写完后通知宿主立即导入。
+     *
+     * <p>健康进程里的导入 hook 靠 {@code ContentObserver} 盯着本 provider 的
+     * 两个 URI。归档走的 {@code HealthRecordStore.enqueueMeasurement} 是直接写
+     * SQLite 的，不经过 provider 的 {@code call()}，所以那一路不会发通知 ——
+     * 结果是分钟数据进了库却没人来读，宿主健康里的步数一直停在上一轮。
+     *
+     * <p>这里补一次通知。批量归档只发一次，不按条发。
+     */
+    public static void notifyArchived(android.content.Context context) {
+        if (context == null) return;
+        try {
+            context.getContentResolver().notifyChange(URI, null);
+            context.getContentResolver().notifyChange(RECORDS_URI, null);
+        } catch (RuntimeException unavailable) {
+            // 通知失败不影响数据本身：下一次宿主启动时仍会导入。
+        }
+    }
+
     @Override public boolean onCreate() {
         store = new HealthRecordStore(getContext());
         return true;

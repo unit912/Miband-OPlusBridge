@@ -113,14 +113,28 @@ final class OHealthStepWriter {
         SharedPreferences written = context.getSharedPreferences("oplusband-step-import", Context.MODE_PRIVATE);
         int inserted = 0;
         int skipped = 0;
+        // 2026-10-21: 日汇总变了，宿主会把那一天的分钟明细一起清掉
+        // （表 1002 的新行让宿主重算当天，表 1001 的行随之消失）。这时
+        // 记忆里「这些分钟都写过了」已经不成立 —— 不作废的话，writeChart
+        // 算出的增量全是 0，明细再也补不回来，柱状图就空了。
+        // 现象：v124 写入 799 行时柱状图正常；v125 里 inserted=1 的那一轮
+        // 把明细清空、chart=0 没补回来，之后每轮都是 chart=0。
+        java.util.Set<Integer> rebuilt = new java.util.HashSet<>();
         for (BandHistoryParser.StepDay day : days) {
             try {
-                if (writeStat(api, account, device, day, written)) inserted++;
-                else skipped++;
+                if (writeStat(api, account, device, day, written)) {
+                    inserted++;
+                    rebuilt.add(day.date);
+                } else {
+                    skipped++;
+                }
             } catch (Exception failure) {
                 skipped++;
                 XposedBridge.log("OplusBandBridge OHEALTH_STEP_STAT_FAIL date=" + day.date + " " + failure);
             }
+        }
+        for (int date : rebuilt) {
+            forgetMinutes(written, device, date);
         }
         int chart = 0;
         for (BandHistoryParser.StepDay day : days) {
@@ -256,6 +270,21 @@ final class OHealthStepWriter {
         // 这一天重建一次。
         String version = device + ":" + day.date + ":minute-v4";
         boolean rebuild = !"1".equals(written.getString(version, ""));
+        int writtenMode = minuteSportMode(DEVICE_WATCH.equals(category));
+        // 2026-10-21: 宿主会在收到那一天的日汇总新行（表 1002）时把同一天的
+        // 分钟明细（表 1001）一起清掉。记忆里「这些分钟写过了」因此变成假话：
+        // 增量全为 0，明细再也补不回来，柱状图空白。所以每次都要问宿主
+        // 「你那边还有几行」，为 0 就把这一天重建。
+        // 读回按时间桶聚合，宿主有行时至少返回 1，所以 0 是可靠信号。
+        if (!rebuild) {
+            List<?> left = hostRows(api, account, device, day, writtenMode);
+            if (left != null && left.isEmpty() && hasBar(minutes)) {
+                rebuild = true;
+                written.edit().remove(version).commit();
+                HookRuntime.log("OHEALTH_STEP_CHART_REBUILD date=" + day.date
+                        + " hostRows=0 bars=" + countBars(minutes));
+            }
+        }
         if (rebuild) {
             try {
                 host.deleteRows(api, TABLE_DETAIL, account, device, day.startMs, day.startMs + 86_400_000L);
@@ -286,6 +315,16 @@ final class OHealthStepWriter {
             indexes.add(minute);
         }
         if (rows.isEmpty()) {
+            // 没有要写的分钟时也要看一眼宿主还剩多少行：这行日志是判断
+            // 「宿主把明细清掉了」的唯一依据。
+            try {
+                List<?> left = hostRows(api, account, device, day, writtenMode);
+                HookRuntime.log("OHEALTH_STEP_CHART_EMPTY date=" + day.date
+                        + " bars=" + indexes.size() + " hostRows=" + (left == null ? -1 : left.size())
+                        + " rebuild=" + rebuild);
+            } catch (Exception unreadable) {
+                // 读不回不影响写入判断。
+            }
             if (rebuild && !written.edit().putString(version, "1").commit()) {
                 throw new IllegalStateException("STEP_IMPORT_MEMORY_FAILED");
             }
@@ -300,7 +339,6 @@ final class OHealthStepWriter {
         // - every groupUnit from 0 to 10 returns the same row count, and writing the day one row at
         // a time still reads back bucketed. So the chart check cannot compare per minute; it has to
         // compare totals against the buckets the host actually reports.
-        int writtenMode = minuteSportMode(DEVICE_WATCH.equals(category));
         List<?> confirmed = host.readRows(api, account, TABLE_DETAIL, device, day.startMs, dayEnd,
                 OHealthHealthImportHook.HostContract.GROUP_UNIT_DETAIL, false,
                 MINUTES_PER_DAY + 24, writtenMode);
@@ -483,6 +521,48 @@ final class OHealthStepWriter {
             return new int[3];
         }
         return parts;
+    }
+
+    /** 宿主那边这一天还剩多少行分钟明细。读不回时返回 null。 */
+    private List<?> hostRows(Object api, String account, String device,
+            BandHistoryParser.StepDay day, int writtenMode) throws Exception {
+        return host.readRows(api, account, TABLE_DETAIL, device, day.startMs,
+                day.startMs + 86_400_000L,
+                OHealthHealthImportHook.HostContract.GROUP_UNIT_DETAIL, false,
+                MINUTES_PER_DAY + 24, writtenMode);
+    }
+
+    private static boolean hasBar(MinuteBar[] minutes) {
+        return countBars(minutes) > 0;
+    }
+
+    private static int countBars(MinuteBar[] minutes) {
+        int bars = 0;
+        for (MinuteBar bar : minutes) {
+            if (bar != null) bars++;
+        }
+        return bars;
+    }
+
+    /**
+     * 忘掉某一天已经写过的分钟。
+     *
+     * <p>宿主收到那一天的日汇总新行（表 1002）会把同一天的分钟明细（表 1001）
+     * 一起清掉。记忆里留着「这些分钟写过了」就会让后面的增量判定全为 0，
+     * 明细再也补不回来。所以日汇总一变，就要把这一天的分钟记忆清掉，
+     * 让下一轮按重建的方式整段重写。
+     *
+     * <p>清掉版本标记就够了：{@code writeChart} 看到标记不在就走 rebuild，
+     * 那一轮会以零为基线重写全天分钟，并把新的指纹写回记忆。
+     */
+    private static void forgetMinutes(SharedPreferences written, String device, int date) {
+        try {
+            SharedPreferences.Editor editor = written.edit();
+            editor.remove(device + ":" + date + ":minute-v4");
+            editor.commit();
+        } catch (RuntimeException unavailable) {
+            // 记忆清不掉时下一轮仍会按增量判定，明细可能补不回来。
+        }
     }
 
     /**
