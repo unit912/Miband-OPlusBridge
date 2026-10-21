@@ -535,9 +535,30 @@ public final class OHealthHealthImportHook {
                 }
             }
             drain();
-            if (steps != null) steps.write(context);
+            // 步数与运动各写各的：一段失败不该把另一段也带下水。
+            // 之前 steps.write 抛在 sleep 之后，会直接跳到外层 catch，
+            // 睡眠、步数、运动三段只剩一段跑完，而且重试退到 60 秒冷却。
+            if (steps != null) {
+                try {
+                    steps.write(context);
+                } catch (SecurityException paused) {
+                    throw paused;
+                } catch (Exception | LinkageError stepFail) {
+                    retrySoon |= transientImport(stepFail);
+                    logImportFailure(stepFail);
+                }
+            }
             publishCard();
-            if (sports != null) sports.write(context);
+            if (sports != null) {
+                try {
+                    sports.write(context);
+                } catch (SecurityException paused) {
+                    throw paused;
+                } catch (Exception | LinkageError sportFail) {
+                    retrySoon |= transientImport(sportFail);
+                    logImportFailure(sportFail);
+                }
+            }
             lastFailure = null;
             if (retrySoon) scheduleRetry(2_000);
             OHealthHomeMetricHook.requestReload();

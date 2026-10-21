@@ -250,7 +250,11 @@ final class OHealthStepWriter {
             throws Exception {
         if (!prepareDetail()) return 0;
         MinuteBar[] minutes = MinuteBar.day(records, day.startMs, day.timezone);
-        String version = device + ":" + day.date + ":minute-v3";
+        // 2026-10-21: minute-v4. v3 的记忆键（n<分钟>）与当前 enqueue 的
+        // recordId 格式对不上，宿主里那一天的分钟行其实没写进去，但记忆说
+        // 「写过了」→ 之后每轮增量都是 0，柱状图永远空着。v4 换掉键并让
+        // 这一天重建一次。
+        String version = device + ":" + day.date + ":minute-v4";
         boolean rebuild = !"1".equals(written.getString(version, ""));
         if (rebuild) {
             try {
@@ -481,8 +485,20 @@ final class OHealthStepWriter {
         return parts;
     }
 
+    /**
+     * 记忆里「这一分钟写到了什么」的键。
+     *
+     * <p>2026-10-21：前缀从 {@code n} 换成 {@code m}。旧键（{@code <设备>:<日期>:n<分钟>}）
+     * 是更早一版代码写的，那版写入用的 recordId 格式和现在
+     * {@code HealthRecordStore.enqueueMeasurement} 生成的对不上，于是同一分钟
+     * 的「已写值」和实际入库的行是两个东西：增量判定算出 0，宿主健康里的
+     * 步数柱状图一直空着，而健康 App 里的步数总量还停在几百步。
+     *
+     * <p>换前缀后旧键不再命中，分钟数据会按当前格式重写一遍 —— 表 1001 的行
+     * 是 upsert，重复写不会翻倍。
+     */
     private static String minuteKey(String device, int date, int minute) {
-        return device + ":" + date + ":n" + minute;
+        return device + ":" + date + ":m" + minute;
     }
 
     /**

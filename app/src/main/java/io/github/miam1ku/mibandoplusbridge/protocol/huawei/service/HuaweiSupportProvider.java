@@ -251,12 +251,42 @@ public final class HuaweiSupportProvider implements HuaweiSocketCallback {
      * @param onDone 回调；读不到心率时传 -1，失败原因走 {@code onError}
      */
     public void readHeartRate(HeartRateListener onDone) {
+        readHeartRate(onDone, null);
+    }
+
+    /**
+     * 心率与分钟样本一起取回。
+     *
+     * <p>GT3 的心率搭在步数分钟明细里（0x0B 的每个分钟容器带自己的 feature
+     * bitmap），所以同一次拉取里 {@code samples} 已经含有那一分钟的步数、
+     * 卡路里和距离。周期心跳链每 5 分钟走这条路，之前只把心率留下、步数丢掉，
+     * 结果宿主健康里的步数明细停在握手那一次拉到的窗口，越走越旧。
+     *
+     * <p>{@code onSamples} 非空时，同一批样本会交给它；这一步只做归档，
+     * 写库的失败不会影响心率回调。
+     *
+     * @param onDone 回调；读不到心率时传 -1，失败原因走 {@code onError}
+     * @param onSamples 同批分钟样本的消费者，可为 null
+     */
+    public void readHeartRate(HeartRateListener onDone,
+            java.util.function.Consumer<java.util.List<FitnessData.MessageData.StepResponse.SubContainer>>
+                    onSamples) {
         int endSec = (int) (System.currentTimeMillis() / 1000L);
-        readSteps(endSec - 3600, endSec,
+        int startSec = endSec - 3600;
+        readSteps(startSec, endSec,
                 new GetFitnessDataRequest.StepsListener() {
                     @Override
                     public void onSteps(java.util.List<FitnessData.MessageData
                             .StepResponse.SubContainer> samples) {
+                        if (onSamples != null) {
+                            try {
+                                onSamples.accept(samples);
+                            } catch (RuntimeException refused) {
+                                // 归档失败不该拖垮心率：这条链还要报电量和睡眠。
+                                LOG.warn("FitnessData sample consumer failed: "
+                                        + refused.getClass().getSimpleName());
+                            }
+                        }
                         int bpm = -1;
                         int atSec = 0;
                         for (FitnessData.MessageData.StepResponse.SubContainer s : samples) {

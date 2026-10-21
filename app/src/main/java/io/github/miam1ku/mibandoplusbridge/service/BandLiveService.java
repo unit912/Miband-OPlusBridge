@@ -1293,7 +1293,7 @@ public final class BandLiveService extends Service {
                                 BandLiveService.this, "HUAWEI_HR_FAILED " + message);
                         advance.run();
                     }
-                });
+                }, samples -> enqueueHuaweiMinutes(samples, 3600L));
                 return;
             }
             case 3: {
@@ -1393,11 +1393,41 @@ public final class BandLiveService extends Service {
      *
      * @param onDone 链完成（成功或失败）后推进串行拉取的下一段
      */
+    /**
+     * 把一批分钟样本写进健康队列。
+     *
+     * <p>GT3 的心率搭在步数分钟明细里，所以周期心跳链拉心率时同一批样本里
+     * 已经带着那一分钟的步数、卡路里和距离。之前这条链只取心率、步数丢掉，
+     * 宿主健康里的步数明细就停在握手那一次拉到的窗口，之后越走越旧 ——
+     * 表现就是健康 App 里的步数柱状图一直是空的、步数总量不动。
+     *
+     * <p>这里把样本交给 {@link io.github.miam1ku.mibandoplusbridge.data.HuaweiStepsImporter}，
+     * 它自己负责窗口裁剪、清理旧行和去重，重复喂同一批样本是安全的。
+     *
+     * @param windowSec 这批样本覆盖的窗口长度，用来定位窗口起点
+     */
+    private void enqueueHuaweiMinutes(
+            java.util.List<io.github.miam1ku.mibandoplusbridge.protocol.huawei.packets
+                    .FitnessData.MessageData.StepResponse.SubContainer> samples,
+            long windowSec) {
+        if (samples == null || samples.isEmpty()) return;
+        long now = System.currentTimeMillis();
+        long from = now - windowSec * 1000L;
+        java.util.List<io.github.miam1ku.mibandoplusbridge.protocol.huawei.packets
+                .FitnessData.MessageData.StepResponse.SubContainer> copy =
+                new java.util.ArrayList<>(samples);
+        new Thread(() -> {
+            io.github.miam1ku.mibandoplusbridge.data.HuaweiStepsImporter.enqueue(
+                    BandLiveService.this,
+                    HuaweiDeviceRegistry.deviceId(BandLiveService.this), copy,
+                    java.time.ZoneId.systemDefault(), from, now);
+        }, "HuaweiMinuteArchive").start();
+    }
+
     private void pullHuaweiStepHistory(
             HuaweiSupportProvider provider,
             java.util.concurrent.atomic.AtomicBoolean finalized, long epoch,
-            Runnable onDone) {
-        long now = System.currentTimeMillis();
+            Runnable onDone) {        long now = System.currentTimeMillis();
         long from = now - 24L * 3_600_000L;
         provider.readSteps((int) (from / 1000L), (int) (now / 1000L), true,
                 new io.github.miam1ku.mibandoplusbridge.protocol.huawei.requests
@@ -1767,7 +1797,7 @@ public final class BandLiveService extends Service {
                             refreshHuaweiBattery(provider, finalized, epoch);
                             maybePullSleep(provider, finalized, epoch, NO_ADVANCE);
                         }
-                    });
+                    }, samples -> enqueueHuaweiMinutes(samples, 3600L));
                 }
             }
         } catch (InterruptedException interrupted) {
