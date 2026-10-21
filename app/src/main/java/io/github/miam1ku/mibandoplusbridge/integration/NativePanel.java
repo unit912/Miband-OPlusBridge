@@ -21,7 +21,14 @@ public final class NativePanel {
     public static final String HEALTH = "com.heytap.health";
     /** Health's native page accepts this OPPO band model. */
     public static final String BAND_MODEL = "OB19B1";
-    private static final Pattern BAND = Pattern.compile("miband11_[0-9a-f]{64}");
+    /**
+     * Device ids this bridge owns. The Xiaomi chain uses {@code miband11_} plus a
+     * 64-hex fingerprint, the Huawei chain {@code huaweigt3_} plus the same shape.
+     * Both have to be listed: a control-center tap on the band hands the detail
+     * intent to the Health panel, and the check runs on the device id the host
+     * knows the card by.
+     */
+    private static final Pattern BAND = Pattern.compile("(miband11_|huaweigt3_)[0-9a-f]{64}");
 
     private NativePanel() {}
 

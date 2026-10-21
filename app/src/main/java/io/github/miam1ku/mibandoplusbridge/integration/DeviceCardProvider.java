@@ -230,7 +230,16 @@ public final class DeviceCardProvider extends ContentProvider {
             }
         }
         requireReader();
-        if (!"bandDisplay".equals(method)) throw new SecurityException("DEVICE_CARD_READ_ONLY");
+        if (!"bandDisplay".equals(method)) {
+            // The host drives the card through a small protocol of its own
+            // (AppDeviceService): card_show, card_hide, connect, disconnect,
+            // delete_device. Tapping the card in device space calls card_show,
+            // and an unknown method used to throw SecurityException, which
+            // crossed the binder and popped "the app has stopped" over the
+            // host. Answering with an empty bundle keeps the host working even
+            // when it asks for something this bridge does not implement.
+            return hostCardCall(method, extras);
+        }
         HostKeepAlive.ensureBridge(getContext());
         var state = state();
         Bundle display = new Bundle();
@@ -259,6 +268,40 @@ public final class DeviceCardProvider extends ContentProvider {
         display.putString("watchfaces", state.getString("watchfaces", ""));
         display.putLong("watchfacesAtMs", state.getLong("watchfacesAtMs", 0));
         return display;
+    }
+
+    /**
+     * 宿主驱动设备卡的那套小协议（{@code AppDeviceService}）。
+     *
+     * <p>宿主在设备空间点卡片时会调 {@code card_show}，卡片隐藏时调
+     * {@code card_hide}，连接态用 {@code connect}/{@code disconnect}，
+     * 删除用 {@code delete_device}。小米 App 作为 DeviceApp 时实现了整套，
+     * 桥接自建 DeviceApp 就得同样回应，否则宿主那边直接抛异常。
+     *
+     * <p>这里全部返回空 Bundle：本桥接的连接状态由它自己的实时快照提供
+     * （{@code bandDisplay}），宿主问来的 connect/disconnect 只是 UI 层的
+     * 开关动作，不需要真的连蓝牙。{@code delete_device} 走桥接自己的
+     * 「从健康移除」流程，先只记日志。
+     *
+     * <p>不认识的方法同样返回空 Bundle，而不是抛异常 —— 宿主以后加新方法时，
+     * 这里不会把「点了卡就崩」重新引回来。
+     */
+    private Bundle hostCardCall(String method, Bundle extras) {
+        android.util.Log.i("OplusBandBridge", "DEVICE_CARD_HOST_CALL method=" + method);
+        Bundle result = new Bundle();
+        switch (method == null ? "" : method) {
+            case "card_show", "card_hide", "connect", "disconnect" -> {
+                // The host only needs an answer it can treat as handled.
+            }
+            case "delete_device" -> {
+                // Deleting the band is driven by the bridge's own flow; the
+                // host's call is only a notification that the user asked.
+            }
+            default -> {
+                // Unknown method: stay silent rather than fail the host.
+            }
+        }
+        return result;
     }
 
     /**
