@@ -52,6 +52,10 @@ final class OHealthStepWriter {
     private Method detailAccount, detailDevice, detailStart, detailEnd, detailSteps, detailCalories;
     private Method detailDistance, detailWorkout, detailMode, detailDisplay, detailType, detailZone;
     private Method detailGetStart, detailGetSteps, detailGetDevice, detailGetEnd;
+    private Method detailGetMode, detailGetType;
+    /** Chart data type the host returns for an aggregated (groupUnit>0) detail read. */
+    private Class<?> tsdClass;
+    private Method tsdTimestamp, tsdY;
 
     OHealthStepWriter(OHealthHealthImportHook.HostContract host) throws ReflectiveOperationException {
         this.host = host;
@@ -90,6 +94,14 @@ final class OHealthStepWriter {
         String queued = band.getString("deviceId");
         String device = OHealthDeviceHook.healthId(queued);
         String category = deviceCategory(band.getString("modelId", ""));
+        // 2026-10-22 诊断探针：用系统当日区间无条件复刻图表查询（不依赖 today 是否在 days 里）。
+        try {
+            java.time.ZonedDateTime now = java.time.ZonedDateTime.now(java.time.ZoneId.systemDefault());
+            java.time.ZonedDateTime midnight = now.toLocalDate().atStartOfDay(java.time.ZoneId.systemDefault());
+            long startMs = midnight.toInstant().toEpochMilli();
+            long endMs = startMs + 86_400_000L;
+            probeChartVariants(api, account, device, startMs, endMs, "PRE");
+        } catch (Throwable ignored) { }
         List<HealthRecord> records = history(context, account, queued);
         List<BandHistoryParser.StepDay> days = new ArrayList<>(BandHistoryParser.preferLiveTotal(
                 BandHistoryParser.stepDays(records), band.getLong("stepsToday", -1),
@@ -161,6 +173,14 @@ final class OHealthStepWriter {
                 + " inserted=" + inserted + " skipped=" + skipped + " chart=" + chart;
         HookRuntime.log(summary);
         XposedBridge.log("OplusBandBridge " + summary);
+        // 2026-10-22 写完后再次复刻图表查询，确认刚写入的分钟行是否真能被图表读到。
+        try {
+            java.time.ZonedDateTime now2 = java.time.ZonedDateTime.now(java.time.ZoneId.systemDefault());
+            java.time.ZonedDateTime midnight2 = now2.toLocalDate().atStartOfDay(java.time.ZoneId.systemDefault());
+            long s2 = midnight2.toInstant().toEpochMilli();
+            long e2 = s2 + 86_400_000L;
+            probeChartVariants(api, account, device, s2, e2, "POST");
+        } catch (Throwable ignored) { }
     }
 
     private boolean writeStat(Object api, String account, String device, BandHistoryParser.StepDay day,
@@ -264,6 +284,10 @@ final class OHealthStepWriter {
             throws Exception {
         if (!prepareDetail()) return 0;
         MinuteBar[] minutes = MinuteBar.day(records, day.startMs, day.timezone);
+        // 2026-10-22 修法：把当日逐小时手表步数写进记忆（hour:<date>），供图表层
+        // transDbDetailToChartData 注入使用。这一路绕过宿主表 1001 存储，
+        // 即使宿主把分钟明细清掉，柱状图也能从记忆里拿到手表逐小时步数。
+        rememberHourBars(written, device, day, minutes);
         // 2026-10-21: minute-v4. v3 的记忆键（n<分钟>）与当前 enqueue 的
         // recordId 格式对不上，宿主里那一天的分钟行其实没写进去，但记忆说
         // 「写过了」→ 之后每轮增量都是 0，柱状图永远空着。v4 换掉键并让
@@ -333,6 +357,9 @@ final class OHealthStepWriter {
         for (int from = 0; from < rows.size(); from += INSERT_CHUNK) {
             host.insertRows(api, TABLE_DETAIL, rows.subList(from, Math.min(rows.size(), from + INSERT_CHUNK)));
         }
+        // 2026-10-22 决定性：插入后零时间差复刻图表真实查询（dev=null g=3 m=-2 parse=2 [start,now]）
+        // 以及 dev=MAC 变体、g=4 变体，确认"行没写进去"还是"晚 2 秒被清/被设备过滤"。
+        probeChartImmediate(api, account, device, day, writtenMode);
         long dayEnd = day.startMs + 86_400_000L;
         // The host filters table 1001 by sport mode, and its read always aggregates the day into a
         // fixed set of time buckets: a minute-exact readback is not available. Confirmed on device
@@ -499,6 +526,23 @@ final class OHealthStepWriter {
             }
             detailGetSteps = getter(detailClass, "getSteps", int.class);
             detailGetDevice = getter(detailClass, "getDeviceUniqueId", String.class);
+            detailGetMode = getter(detailClass, "getSportMode", int.class);
+            try {
+                detailGetType = getter(detailClass, "getDeviceType", String.class);
+            } catch (NoSuchMethodException noType) {
+                detailGetType = null;
+            }
+            // The aggregated (groupUnit>0) detail read returns chart rows of this type instead of
+            // raw SportDataDetail. Resolved from the host loader so the diagnostic can read the
+            // same objects the chart's transDbDetailToChartData consumes.
+            try {
+                tsdClass = Class.forName(
+                        "com.heytap.health.core.widget.charts.data.TimeStampedData", false, host.loader);
+                tsdTimestamp = tsdClass.getMethod("getTimestamp");
+                tsdY = tsdClass.getMethod("getY");
+            } catch (ReflectiveOperationException | LinkageError noTsd) {
+                tsdClass = null;
+            }
             return true;
         } catch (ReflectiveOperationException | LinkageError unsupported) {
             detailClass = null;
@@ -523,13 +567,215 @@ final class OHealthStepWriter {
         return parts;
     }
 
+    /**
+     * 2026-10-22 诊断：dump 表 1001 当天原始行。两趟读取：(a) 免设备 —— 看宿主自己 73 行的
+     * device/mode/type 长什么样；(b) 只限本设备 —— 看华为的行还在不在。
+     * 用 g=4（GROUP_UNIT_DETAIL）+ parse，返回 SportDataDetail 原始行。只打日志，不改数据。
+     */
+    private void dumpHostRaw(Object api, String account, String device, long startMs, long endMs) {
+        dumpOne(api, account, null, startMs, endMs, "ALL");
+        dumpOne(api, account, device, startMs, endMs, "OURS");
+    }
+
+    private void dumpOne(Object api, String account, String device,
+            long startMs, long endMs, String tag) {
+        try {
+            // g=4（GROUP_UNIT_DETAIL）+ parse，返回 SportDataDetail 原始行，可看 device/mode/type。
+            List<?> rows = host.readRows(api, account, TABLE_DETAIL, device,
+                    startMs, endMs, OHealthHealthImportHook.HostContract.GROUP_UNIT_DETAIL, true, 2000, null);
+            StringBuilder text = new StringBuilder("OHEALTH_STEP_CHART_RAW tag=").append(tag)
+                    .append(" rows=").append(rows.size())
+                    .append(" dev=").append(device == null ? "-" : device);
+            int shown = 0;
+            for (Object row : rows) {
+                if (!detailClass.isInstance(row)) continue;
+                if (shown >= 12) break;
+                shown++;
+                text.append(" [");
+                try { text.append("dev=").append(detailGetDevice.invoke(row)); } catch (Throwable t) { text.append("dev=?"); }
+                try { text.append(" mode=").append(detailGetMode.invoke(row)); } catch (Throwable t) { text.append(" mode=?"); }
+                try { text.append(" type=").append(detailGetType == null ? "?" : detailGetType.invoke(row)); } catch (Throwable t) { text.append(" type=?"); }
+                try {
+                    long start = (Long) detailGetStart.invoke(row);
+                    text.append(" off=").append(start - startMs);
+                } catch (Throwable t) { text.append(" off=?"); }
+                try {
+                    long finish = (Long) detailGetEnd.invoke(row);
+                    text.append(" endOff=").append(finish - startMs);
+                } catch (Throwable t) { text.append(" endOff=?"); }
+                try { text.append(" steps=").append(detailGetSteps.invoke(row)); } catch (Throwable t) { text.append(" steps=?"); }
+                text.append(']');
+            }
+            HookRuntime.log(text.toString());
+            XposedBridge.log("OplusBandBridge " + text);
+        } catch (Throwable failure) {
+            HookRuntime.log("OHEALTH_STEP_CHART_RAW_FAIL tag=" + tag + " "
+                    + failure.getClass().getSimpleName());
+        }
+    }
+
+    /**
+     * 2026-10-22 决定性诊断：精确复刻图表 {@code StepGoalRepository.queryDetail} 的读取
+     * （表 1001 / groupUnit=3 / setReadSportMode(-2) / 不设设备 / setIsParse(2)），把宿主
+     * 返回给图表的聚合行（TimeStampedData）按小时归并成 24 根柱的 Y 值。
+     *
+     * <p>对比两趟：
+     * <ol>
+     *   <li>{@code all} —— 不设设备，等于图表实际拿到的全部（手机+手表+华为）；</li>
+     *   <li>{@code ours} —— 只限华为设备，看华为的行在聚合读里到底在不在。</li>
+     * </ol>
+     * 若 {@code oursHour} 24 根柱全是 0，说明华为的 mode=-1 / type="Watch" 行被聚合读排除了，
+     * 这就是柱状图空白的根因；若 {@code oursHour} 有值而 {@code allHour} 没有，则是图表另有过滤。
+     * 只打日志，不动数据。
+     */
+    /**
+     * 2026-10-22 决定性诊断：图表 queryDetail 读 table=1001 dev=null mode=-2 group=3（按小时聚合）。
+     * transDbDetailToChartData 在输入为空时直接返回 24 根零柱 → 空白。本探针逐项变参复刻该查询，
+     * 锁定"为什么返回 0 行"：是 dev=null 被宿主当成当前主设备（手机）排除了我们的手表行，
+     * 还是 mode=-2 过滤掉了我们写的 mode=-1 行，还是 groupUnit=3 聚合要求特定行形状。
+     */
+    private void probeChartVariants(Object api, String account, String device, long startMs, long endMs, String tag) {
+        if (!prepareDetail()) {
+            HookRuntime.log("OHEALTH_CHART_PROBE2_SKIP detail-unavailable tag=" + tag);
+            return;
+        }
+        // 2026-10-22 修正：原探针用 endMs=startMs+86400000（次日 00:00，未来时刻），
+        // 宿主明细按日期分区，读到跨天的 end 会落到明天的空分区 → 返回 0，制造「行被删」假象。
+        // 真实图表查询 end=now。这里把 end 夹到 now，复刻图表实际窗口。
+        long now = System.currentTimeMillis();
+        long winEnd = Math.min(endMs, now);
+        StringBuilder txt = new StringBuilder("OHEALTH_CHART_PROBE2_").append(tag)
+                .append(" start=").append(startMs).append(" end=").append(winEnd).append("(now=").append(now).append(")");
+        // V0 图表真实查询：dev=null g=3 parse mode=-2
+        txt.append("\n  V_chart   dev=null  g=3 p  m=-2 ").append(probeOne(api, account, device, startMs, winEnd, null, 3, true, -2));
+        // V1 带我们的设备
+        txt.append("\n  V_devours dev=OUR  g=3 p  m=-2 ").append(probeOne(api, account, device, startMs, winEnd, device, 3, true, -2));
+        // V2 不带设备但用我们写的 mode=-1
+        txt.append("\n  V_modeOurs dev=null g=3 p  m=-1 ").append(probeOne(api, account, device, startMs, winEnd, null, 3, true, -1));
+        // V3 带设备 + 我们写的 mode=-1
+        txt.append("\n  V_devMode dev=OUR  g=3 p  m=-1 ").append(probeOne(api, account, device, startMs, winEnd, device, 3, true, -1));
+        // V4 groupUnit=4（我们 hostRows 用的聚合）不带设备
+        txt.append("\n  V_g4      dev=null g=4 p  m=-2 ").append(probeOne(api, account, device, startMs, winEnd, null, 4, true, -2));
+        // V5 原始行（g=0 不聚合）带设备 + 我们写的 mode=-1 —— 确认我们的行在库里存在
+        txt.append("\n  V_raw     dev=OUR  g=0 np m=-1 ").append(probeOne(api, account, device, startMs, winEnd, device, 0, false, -1));
+        // V6 原始行不带设备 + mode=-1
+        txt.append("\n  V_rawAll  dev=null g=0 np m=-1 ").append(probeOne(api, account, device, startMs, winEnd, null, 0, false, -1));
+        HookRuntime.log(txt.toString());
+        XposedBridge.log("OplusBandBridge " + txt);
+        // 暴露宿主自己那 73 行的真实 device/mode/type（用 g=4 dev=null 聚合读，hostRows 同款可工作），
+        // 判断「华为行被设备过滤」还是「华为行根本没写进去」。
+        dumpHostRaw(api, account, device, startMs, winEnd);
+    }
+
+    /** 复刻一次图表查询并返回 "count=N sumY=S"（聚合行按小时归并 Y；原始行只算 count）。 */
+    private String probeOne(Object api, String account, String device, long startMs, long endMs,
+                            String dev, int group, boolean parse, int mode) {
+        try {
+            List<?> rows = host.readRows(api, account, TABLE_DETAIL, dev, startMs, endMs,
+                    group, parse, 4000, mode);
+            if (rows == null) return "count=-1";
+            int[] hour = new int[24];
+            long sum = sumHour(rows, hour);
+            return "count=" + rows.size() + " sumY=" + sum;
+        } catch (Throwable failure) {
+            return "ERR " + failure.getClass().getSimpleName() + " " + failure.getMessage();
+        }
+    }
+
+    /**
+     * 2026-10-22 决定性：在 writeChart 插入循环之后、零时间差，复刻图表真实查询与若干变体。
+     * 若此处的 V_devours/V_rawMac 立即 >0 而 2 秒后的 V_devours=0，则是"随后被宿主清掉"；
+     * 若此处就已经是 0，则是 g=3/g=0 读与我们的 mode/device 形状不兼容（读不到，而非没写）。
+     */
+    private void probeChartImmediate(Object api, String account, String device,
+            BandHistoryParser.StepDay day, int writtenMode) {
+        if (!prepareDetail()) return;
+        long now = System.currentTimeMillis();
+        long end = Math.min(day.startMs + 86_400_000L, now);
+        String line = "OHEALTH_CHART_IMM date=" + day.date
+                + " V_chart=" + probeOne(api, account, device, day.startMs, end, null, 3, true, -2)
+                + " V_devours=" + probeOne(api, account, device, day.startMs, end, device, 3, true, -2)
+                + " V_devM1=" + probeOne(api, account, device, day.startMs, end, device, 3, true, writtenMode)
+                + " V_rawMac=" + probeOne(api, account, device, day.startMs, end, device, 0, false, -2)
+                + " V_g4mac=" + probeOne(api, account, device, day.startMs, end, device, 4, true, -2);
+        HookRuntime.log(line);
+        XposedBridge.log("OplusBandBridge " + line);
+        // 零时间差 dump 存活行：看"手机设备 id"长什么样、我们的 step 柱到底在不在（device/mode/type/steps）。
+        dumpOne(api, account, null, day.startMs, end, "IMM_ALL");
+        dumpOne(api, account, device, day.startMs, end, "IMM_OURS");
+    }
+
+    /** Sums aggregated chart rows into a 24-hour bucket array and returns the grand total (y is float). */
+    private long sumHour(List<?> rows, int[] hour) {
+        if (tsdClass == null || rows == null) return -1;
+        long sum = 0;
+        for (Object row : rows) {
+            if (!tsdClass.isInstance(row)) continue;
+            try {
+                long ts = (Long) tsdTimestamp.invoke(row);
+                float y = (Float) tsdY.invoke(row);
+                java.time.LocalDateTime ldt = java.time.LocalDateTime.ofInstant(
+                        java.time.Instant.ofEpochMilli(ts), java.time.ZoneId.systemDefault());
+                int h = ldt.getHour();
+                int yi = (int) y;
+                if (h >= 0 && h < 24) {
+                    hour[h] += yi;
+                    sum += yi;
+                }
+            } catch (Throwable ignored) {
+                // 一行解析失败不影响整体。
+            }
+        }
+        return sum;
+    }
+
+    private static String hourStr(int[] hour) {
+        StringBuilder b = new StringBuilder();
+        for (int i = 0; i < 24; i++) {
+            b.append(i).append('=').append(hour[i]).append(' ');
+        }
+        return b.toString();
+    }
+
     /** 宿主那边这一天还剩多少行分钟明细。读不回时返回 null。 */
     private List<?> hostRows(Object api, String account, String device,
-            BandHistoryParser.StepDay day, int writtenMode) throws Exception {
-        return host.readRows(api, account, TABLE_DETAIL, device, day.startMs,
+            BandHistoryParser.StepDay day, int writtenMode) throws Exception {        return host.readRows(api, account, TABLE_DETAIL, device, day.startMs,
                 day.startMs + 86_400_000L,
                 OHealthHealthImportHook.HostContract.GROUP_UNIT_DETAIL, false,
                 MINUTES_PER_DAY + 24, writtenMode);
+    }
+
+    /**
+     * 把当日逐小时手表步数写进记忆（{@code hour:<date>}），供图表层注入读取。
+     *
+     * <p>按分钟柱归并成 24 个小时桶：每个有步数的分钟加到它所属小时的桶里。
+     * 这一天没有任何步数柱时清掉该键，避免陈旧数据被图表层注入到别的日期。
+     */
+    private void rememberHourBars(SharedPreferences written, String device, BandHistoryParser.StepDay day,
+            MinuteBar[] minutes) {
+        int[] hour = new int[24];
+        boolean any = false;
+        for (int minute = 0; minute < MINUTES_PER_DAY; minute++) {
+            MinuteBar bar = minutes[minute];
+            if (bar == null) continue;
+            int h = minute / 60;
+            if (h >= 0 && h < 24) {
+                if (hour[h] <= Integer.MAX_VALUE - bar.steps) hour[h] += bar.steps;
+                if (bar.steps > 0) any = true;
+            }
+        }
+        StringBuilder b = new StringBuilder();
+        for (int i = 0; i < 24; i++) {
+            if (i > 0) b.append(',');
+            b.append(hour[i]);
+        }
+        SharedPreferences.Editor editor = written.edit();
+        if (any) {
+            editor.putString("hour:" + day.date, b.toString());
+        } else {
+            editor.remove("hour:" + day.date);
+        }
+        editor.commit();
     }
 
     private static boolean hasBar(MinuteBar[] minutes) {

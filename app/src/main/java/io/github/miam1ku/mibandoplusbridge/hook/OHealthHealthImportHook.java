@@ -4,6 +4,7 @@ package io.github.miam1ku.mibandoplusbridge.hook;
 import io.github.miam1ku.mibandoplusbridge.hook.xposed.HookRuntime;
 import android.app.Application;
 import android.content.Context;
+import android.content.SharedPreferences;
 import android.database.ContentObserver;
 import android.database.Cursor;
 import android.os.Bundle;
@@ -59,6 +60,10 @@ public final class OHealthHealthImportHook {
     private long retryAfter;
     private boolean stressZerosCleared;
     private String lastFailure;
+    /** 图表注入用：TimeStampedData 类/构造器/取值方法（宿主步数柱状图聚合输入）。 */
+    private Class<?> chartTsdClass;
+    private Constructor<?> chartTsdCtor;
+    private Method chartTsdTs;
     private final Runnable work = this::runScheduled;
 
     private OHealthHealthImportHook(Context context, HostContract host, OHealthSleepWriter sleep,
@@ -150,6 +155,69 @@ public final class OHealthHealthImportHook {
                 if (observedApi.getAndSet(api) != api && api != null) request();
             }
         });
+        // 2026-10-22 修法落地：图表（步数柱状图）从表 1001 读 dev=null（=当前/默认设备=手机），
+        // 读不到我们的手表行；且我们写入的手表分钟行也不持久化（被宿主/云同步清掉）。
+        // 根因锁定后，绕过宿主存储：在 transDbDetailToChartData 的输入列表里直接注入
+        // 当日逐小时手表步数。dex 确认 transDbDetailToChartData 唯一调用者是步数柱状图 fetchDetail，
+        // 因此只影响步数柱状图，对日汇总/心率/睡眠等其他数据零影响。
+        // 注入策略：仅当宿主送进来的列表为空或 Y 全 0（即图表本就会空白）时才注入，
+        // 避免与宿主已有的手机步数柱叠加造成重复计数。
+        try {
+            Class<?> repoClass = Class.forName(
+                "com.heytap.health.main.viewmodel.StepGoalRepository", false, host.loader);
+            Class<?> tsdClass = Class.forName(
+                "com.heytap.health.core.widget.charts.data.TimeStampedData", false, host.loader);
+            Method tsdY = tsdClass.getMethod("getY");
+            Method tsdTs = tsdClass.getMethod("getTimestamp");
+            Constructor<?> tsdCtor = findTsdCtor(tsdClass);
+            chartTsdClass = tsdClass;
+            chartTsdTs = tsdTs;
+            chartTsdCtor = tsdCtor;
+            XposedBridge.hookMethod(repoClass.getMethod("transDbDetailToChartData", List.class),
+                new XC_MethodHook() {
+                    @Override protected void beforeHookedMethod(MethodHookParam p) {
+                        try {
+                            Object list = p.args[0];
+                            int n = (list instanceof List) ? ((List<?>) list).size() : -1;
+                            double sumY = 0;
+                            long firstTs = 0;
+                            if (list instanceof List) {
+                                int shown = 0;
+                                for (Object row : (List<?>) list) {
+                                    if (tsdClass.isInstance(row)) {
+                                        try {
+                                            float y = (Float) tsdY.invoke(row);
+                                            sumY += y;
+                                            if (shown == 0) firstTs = (Long) tsdTs.invoke(row);
+                                        } catch (Throwable ignored) { }
+                                        shown++;
+                                    }
+                                }
+                            }
+                            // 主调栈里找调用类（跳过框架/lambda，取第一个 com.heytap 业务类）。
+                            String caller = "?";
+                            for (StackTraceElement s : new Throwable().getStackTrace()) {
+                                String c = s.getClassName();
+                                if (c.startsWith("com.heytap.health") && !c.contains("StepGoalRepository")
+                                        && !c.contains("lambda") && !c.contains("ExternalSynthetic")) {
+                                    caller = c.replace("com.heytap.health.", "");
+                                    break;
+                                }
+                            }
+                            String line = "CHART_INPUT_SIZE n=" + n + " sumY=" + (long) sumY
+                                    + " firstTs=" + firstTs + " caller=" + caller;
+                            // 仅在「图收到非零数据」或「列表为空」时打印，避免空白时反复重绘刷屏。
+                            if (sumY > 0 || n == 0) {
+                                HookRuntime.log(line);
+                                XposedBridge.log("OplusBandBridge " + line);
+                            }
+                            // 修法：仅当宿主输入为空白（空列表或 Y 全 0）时注入手表逐小时步数，
+                            // 修复空柱状图且不与手机已有步数柱重复计数。
+                            injectWatchHourBars(list, n == 0 || sumY == 0);
+                        } catch (Throwable ignored) { }
+                    }
+                });
+        } catch (Throwable ignored) { }
         XposedHelpers.findAndHookMethod(Application.class, "onCreate", new XC_MethodHook() {
             @Override protected void afterHookedMethod(MethodHookParam param) {
                 restoreSystemAccount();
@@ -162,6 +230,82 @@ public final class OHealthHealthImportHook {
             }
         });
     }
+    /**
+     * 在步数柱状图 {@code transDbDetailToChartData} 的输入列表里注入当日（或列表首行所属日）
+     * 的手表逐小时步数。对宿主存储零依赖：数据来自 {@code OHealthStepWriter.writeChart} 写入的
+     * {@code hour:<date>} 记忆（SharedPreferences 名 {@code oplusband-step-import}）。
+     *
+     * <p>仅当 {@code hostBlank} 为真（宿主送进来的列表为空或 Y 全 0，即图表本就会空白）才注入，
+     * 以免与宿主已有的手机步数柱叠加造成重复计数。宿主输入非空时一律跳过。
+     *
+     * <p>目标日期判定：列表非空且首行为 {@code TimeStampedData} 时取首行时间戳的本地日期；
+     * 否则取系统今日。这样翻到过去某天且那一天无宿主数据时不会误注入今日数据。
+     */
+    private void injectWatchHourBars(Object listArg, boolean hostBlank) {
+        if (!hostBlank) return;
+        if (chartTsdClass == null || chartTsdCtor == null) return;
+        if (!(listArg instanceof List)) return;
+        @SuppressWarnings("unchecked")
+        List<Object> list = (List<Object>) listArg;
+        try {
+            ZoneId zone = ZoneId.systemDefault();
+            LocalDate target;
+            if (!list.isEmpty()) {
+                Object first = list.get(0);
+                if (chartTsdClass.isInstance(first)) {
+                    long ts = (Long) chartTsdTs.invoke(first);
+                    target = Instant.ofEpochMilli(ts).atZone(zone).toLocalDate();
+                } else {
+                    target = LocalDate.now(zone);
+                }
+            } else {
+                target = LocalDate.now(zone);
+            }
+            int date = target.getYear() * 10_000 + target.getMonthValue() * 100 + target.getDayOfMonth();
+            SharedPreferences prefs = context.getSharedPreferences("oplusband-step-import", Context.MODE_PRIVATE);
+            String raw = prefs.getString("hour:" + date, null);
+            if (raw == null) return;
+            int[] hour = new int[24];
+            int filled = 0;
+            String[] fields = raw.split(",");
+            for (int i = 0; i < 24 && i < fields.length; i++) {
+                try {
+                    hour[i] = Integer.parseInt(fields[i].trim());
+                    if (hour[i] != 0) filled++;
+                } catch (NumberFormatException ignore) { }
+            }
+            if (filled == 0) return;
+            long midnight = target.atStartOfDay(zone).toInstant().toEpochMilli();
+            int injected = 0;
+            for (int h = 0; h < 24; h++) {
+                int steps = hour[h];
+                if (steps <= 0) continue;
+                // TimeStampedData(long timestamp, float y)：timestamp 落在该小时整点，
+                // 图表按 LocalDateTime.getHour() 归桶，正好落进第 h 根柱。
+                Object bar = chartTsdCtor.newInstance(midnight + (long) h * 3_600_000L, (float) steps);
+                list.add(bar);
+                injected++;
+            }
+            if (injected > 0) {
+                String msg = "CHART_INJECT date=" + date + " bars=" + injected;
+                HookRuntime.log(msg);
+                XposedBridge.log("OplusBandBridge " + msg);
+            }
+        } catch (Throwable ignored) { }
+    }
+
+    /** 在宿主 loader 里找 TimeStampedData 的 (long,float) 构造器，容忍签名差异。 */
+    private static Constructor<?> findTsdCtor(Class<?> type) {
+        for (Constructor<?> ctor : type.getDeclaredConstructors()) {
+            Class<?>[] p = ctor.getParameterTypes();
+            if (p.length == 2 && p[0] == long.class && p[1] == float.class) {
+                ctor.setAccessible(true);
+                return ctor;
+            }
+        }
+        return null;
+    }
+
     /**
      * The setup activity treats a missing login task as cancellation and writes tourist mode
      * on later launches too, even when the system account is still signed in. Put that account
@@ -1070,9 +1214,69 @@ public final class OHealthHealthImportHook {
          */
         static final int GROUP_UNIT_DETAIL = 4;
 
+        /**
+         * 2026-10-22 诊断：惰性地把宿主步数读取入口 {@code readSportHealthData} 挂上钩子，抓出图表页
+         * （StepCard）读取表 1001/1002 时实际使用的 device / sportMode / groupUnit。
+         * 必须在运行期用 {@code api} 的具体实现类挂 —— 接口方法在 LSPosed 上挂不住（实测零命中），
+         * 既有能用的钩子（accountGetter/apiGetter）都是具体类。线程名 OplusBand* 是导入路径，
+         * 其余（main / binder / 异步）多半是 UI/图表路径。
+         */
+        private volatile boolean readHooked;
+        private final Object readHookLock = new Object();
+        private static Method safeGet(Class<?> c, String name) {
+            try { return c.getMethod(name); } catch (NoSuchMethodException ignored) { return null; }
+        }
+        private void ensureReadHook(Object api) {
+            if (readHooked || api == null) return;
+            synchronized (readHookLock) {
+                if (readHooked || api == null) return;
+                try {
+                    Class<?> optClass = Class.forName(
+                            "com.heytap.databaseengine.option.DataReadOption", false, loader);
+                    Method gDev = optClass.getMethod("getDeviceUniqueId");
+                    Method gTbl = optClass.getMethod("getDataTable");
+                    Method gMode = optClass.getMethod("getReadSportMode");
+                    Method gGroup = optClass.getMethod("getGroupUnitType");
+                    Method gAcct = safeGet(optClass, "getAccount");
+                    Method gStart = safeGet(optClass, "getStartTime");
+                    Method gEnd = safeGet(optClass, "getEndTime");
+                    Method pIsParse = safeGet(optClass, "getIsParse");
+                    final Method gParse = pIsParse != null ? pIsParse : safeGet(optClass, "getParse");
+                    XposedBridge.hookMethod(api.getClass().getMethod("readSportHealthData", optClass),
+                            new XC_MethodHook() {
+                                @Override protected void afterHookedMethod(MethodHookParam p) {
+                                    try {
+                                        String thr = Thread.currentThread().getName();
+                                        if (thr.contains("CSSyncUtil")) return;
+                                        Object opt = p.args[0];
+                                        int tbl = (Integer) gTbl.invoke(opt);
+                                        String dev = String.valueOf(gDev.invoke(opt));
+                                        int mode = (Integer) gMode.invoke(opt);
+                                        int group = (Integer) gGroup.invoke(opt);
+                                        String acct = gAcct == null ? "-" : String.valueOf(gAcct.invoke(opt));
+                                        String start = gStart == null ? "-" : String.valueOf(gStart.invoke(opt));
+                                        String end = gEnd == null ? "-" : String.valueOf(gEnd.invoke(opt));
+                                        String parse = "-";
+                                        if (gParse != null) {
+                                            try { parse = String.valueOf(gParse.invoke(opt)); }
+                                            catch (Throwable ignored) { }
+                                        }
+                                        HookRuntime.log("HOST_READ table=" + tbl + " dev=" + dev
+                                                + " mode=" + mode + " group=" + group
+                                                + " acct=" + acct + " start=" + start
+                                                + " end=" + end + " parse=" + parse + " thr=" + thr);
+                                    } catch (Throwable ignored) { }
+                                }
+                            });
+                    readHooked = true;
+                } catch (Throwable ignored) { }
+            }
+        }
+
         /** A raw row read. {@code sportMode} is required for tables the library filters by mode. */
         List<?> readRows(Object api, String account, int table, String device, long start, long end,
                 int groupUnit, boolean parse, int limit, Integer sportMode) throws Exception {
+            ensureReadHook(api);
             Object option = readConstructor.newInstance();
             readAccount.invoke(option, account);
             readStart.invoke(option, Math.max(0, start));
