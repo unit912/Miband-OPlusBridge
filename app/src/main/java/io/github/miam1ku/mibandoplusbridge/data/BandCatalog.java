@@ -89,9 +89,28 @@ public final class BandCatalog {
     /**
      * OPPO health row category ({@code DeviceCategory.BAND} or {@code WATCH}).
      * An unknown model stays {@code Band}, the same fallback as the wristband card.
+     *
+     * <p>2026-10-21: 华为这一支按 {@code Band} 上报，不是 {@code Watch}。
+     *
+     * <p>原因：健康库里「步数」只有一种 —— sport mode 1（普通步行）。作者给
+     * 真·小米手表写的是 {@code Watch} + mode -1，本意是「让手表的步行分钟不进
+     * 手机自己的步行桶」，前提是宿主的产品库里真有那么一条 Watch 产品线。
+     * 华为 GT3 是桥接模拟出来的设备，宿主库里没有它，按 Watch 上报时
+     * mode -1 的分钟行它不认，步数柱状图一直是空的（写入 806 行、回读 1 桶、
+     * 图上无柱）。
+     *
+     * <p>手环这条路是宿主认的：mode 1 的分钟行进它自己的步行桶，柱状图能画出来。
+     * 代价是设备空间卡片的类型也跟着变成手环（{@link #spaceType} 单独判定，
+     * 卡片仍按真表显示手表样式）。总步数因此可能与手机自身传感器相加，
+     * 这是走「宿主认的桶」必须付的代价 —— 与小米手环链路的处境完全相同。
      */
     public static String healthCategory(String model) {
-        return watchForm(model) ? "Watch" : "Band";
+        return watchForm(model) && !huaweiModel(model) ? "Watch" : "Band";
+    }
+
+    /** 华为链路的设备在健康库里按手环上报，见 {@link #healthCategory}。 */
+    private static boolean huaweiModel(String model) {
+        return model != null && model.startsWith("huawei.");
     }
 
     /** Device-space card type. Bands use the system wristband glyph, watches use the watch glyph. */
