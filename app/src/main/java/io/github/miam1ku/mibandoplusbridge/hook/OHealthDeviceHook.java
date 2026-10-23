@@ -1061,49 +1061,23 @@ public final class OHealthDeviceHook {
     }
 
     /**
-     * Health's card for this band. The bridge card lives in another process, so this lookup only sees Health's row.
+     * Health's own device-space card for this band. The bridge card lives in another process,
+     * so this lookup only sees Health's row.
      *
-     * <p>权威信号是健康 App 自己的绑定设备库：设备空间里那张「健康卡」由 Health 的
-     * WatchProvider 按账号绑定列表发布（卡片 id = MAC 的 MD5，小写 hex）。
-     * 早先查 mydevices 的 SDK 设备表（{@code DeviceInfoManager.queryDeviceById}）是错的——
-     * 那张表只收 SDK 自己 register 过的设备，健康卡走 provider-action 聚合，永远查不到，
-     * yield 因此从不触发，设备空间和快捷面板各留一块表。
-     * {@code DMLocalDeviceManager.INSTANCE.getUserBoundDeviceListByMac(mac)} 与 rememberBand 的
-     * {@code saveUserBoundDevice} 是同一个库，同步可读；用户在健康 App 里解绑会同步消失，
-     * 两个方向都正确。健康 App 自己查找失配时会打 {@code DMLocalDeviceManager: getUserBoundDeviceListByMac not find}。
+     * <p>权威信号只取第二道验证：健康 App 自己的卡片表 {@code device_info_v2.db} 里是否真有这台表的行，
+     * 且 WatchProvider 组件处于启用态（见 {@link #healthCardRowExists}）。
      *
-     * <p>★ 2026-10-18 第一步修复：绑定库有条目 ≠ 卡片真的存在。健康 App 的
-     * {@code DeviceIdleDisableWork} 在每次健康进程启动时禁用 WatchProvider 并清空
-     * {@code device_info_v2.db}（实测整表 0 行），此后没有新的发布事件，
-     * mydevices 永远查不到健康卡。此时若仍按旧判定 yield=true，桥接卡让位后
-     * 两边都没有行 → 设备空间/负一屏的手表卡与磁贴整个消失（用户实测：
-     * 一开 OPPO 健康卡片就消失，关掉又回来）。
-     * 所以绑定库命中后必须再验一次卡片表里真有这台表的行，且 WatchProvider 组件处于启用态。
+     * <p>★ 2026-10-23 修复（方案 A）：原先第一道验证依赖健康绑定库
+     * {@code DMLocalDeviceManager.getUserBoundDeviceListByMac}，但该库 DEVICE 表自
+     * 2025-11-11 起一直为空（MAC 在健康数据目录下完全搜不到），导致绑定库命中恒为 false、
+     * yield 恒为 false，桥接卡永远不让位。一旦健康卡因蓝牙重连/发布事件复活，设备空间就出现
+     * 「健康卡 + 桥接卡」双卡（UI 按 MAC 去重失效：健康卡 device_mac 经 provider 脱敏成空串）。
+     * 删除该第一道验证后，判定只剩卡片表+组件：健康卡真在 → 桥接让位（单卡健康）；
+     * 健康卡被清 → 桥接顶上（单卡桥接）。两种状态都单卡，自愈逻辑不变。
      */
-    private static volatile Boolean boundSeen;
     private static volatile Boolean rowSeen;
 
     private static boolean healthCardPresent(ClassLoader loader, String mac) {
-        boolean bound;
-        try {
-            Class<?> local = XposedHelpers.findClass(
-                    "com.heytap.health.devicemanagerimpl.processor.DMLocalDeviceManager", loader);
-            Object instance = local.getField("INSTANCE").get(null);
-            Object found = local.getMethod("getUserBoundDeviceListByMac", String.class)
-                    .invoke(instance, mac);
-            bound = found != null;
-            // 只在翻转时记一行：绑定库增删这台表（用户在健康 App 里绑定/解绑）会改变
-            // yield 方向，是排障时最想看到的信号；常态静默避免每轮刷新都刷屏。
-            if (boundSeen == null || boundSeen != bound) {
-                boundSeen = bound;
-                HookRuntime.log("DEVICE_SPACE_BOUND mac=" + mac + " found=" + boundSeen);
-            }
-        } catch (Throwable failure) {
-            HookRuntime.log("DEVICE_SPACE_BOUND_UNAVAILABLE "
-                    + failure.getClass().getSimpleName());
-            return false;
-        }
-        if (!bound) return false;
         boolean row = healthCardRowExists(mac);
         if (rowSeen == null || rowSeen != row) {
             rowSeen = row;
