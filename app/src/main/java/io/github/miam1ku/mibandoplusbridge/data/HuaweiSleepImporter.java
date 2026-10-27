@@ -173,33 +173,68 @@ public final class HuaweiSleepImporter {
      * 权威结果（和小米侧 retain 的语义一致），否则上一轮写进去的东西 —— 包括后来
      * 判定为伪迹的会话 —— 会一直留在队列里。
      */
+    /**
+     * 合并入口：0x0D 小睡 + TruSleep 夜眠区间一起入队。
+     *
+     * <p>★ TruSleep 专项（2026-10-23）：GT3 整夜睡眠走文件通道而非 0x0C/0x0D，所以这里把
+     * 文件解析出的夜眠起止区间（{@link HuaweiTruSleepParser.TruSleepInterval}）与 0x0D 小睡
+     * 合并。落在某个夜眠区间内部的 0x0D 小睡会被丢弃（避免把「夜眠里的清醒/碎片」再算一遍）。
+     *
+     * <p>夜眠区间暂无分期算法（SLEEP_DATA 的 PPG/ACC 分期未实现，Gadgetbridge 同样是 FIXME），
+     * 先用整段浅睡占位，保证 OPPO 渲染出时长块；分期细化是后续项。
+     */
     public static Result enqueue(android.content.Context context, String deviceId,
-            List<FitnessData.MessageData.SleepResponse.SubContainer> containers, ZoneId zone,
+            List<FitnessData.MessageData.SleepResponse.SubContainer> containers,
+            List<HuaweiTruSleepParser.TruSleepInterval> truSleep, ZoneId zone,
             long windowStartMs, long windowEndMs) {
-        List<Stage> stages = parse(containers);
+        List<Session> all = new ArrayList<>();
+        // 0x0D 小睡
+        for (Session s : sessions(parse(containers))) {
+            // 落入夜眠区间的小睡碎片丢弃
+            boolean inside = false;
+            for (HuaweiTruSleepParser.TruSleepInterval t : truSleep) {
+                if (s.startMs() >= t.startSec() * 1000L && s.endMs() <= t.endSec() * 1000L) {
+                    inside = true;
+                    break;
+                }
+            }
+            if (!inside) all.add(s);
+        }
+        // TruSleep 夜眠区间：整段浅睡占位（分期细化待 SLEEP_DATA）
+        for (HuaweiTruSleepParser.TruSleepInterval t : truSleep) {
+            long from = t.startSec() * 1000L;
+            long to = t.endSec() * 1000L;
+            if (to - from < MIN_SLEEP_MS) continue;
+            all.add(new Session(from, to,
+                    java.util.List.of(new Stage(from, to, BAND_LIGHT))));
+        }
+        return importSessions(context, deviceId, all, zone, windowStartMs, windowEndMs);
+    }
+
+    /** purge 窗口 + 写会话列表 + 返回 summary。提取自原 enqueue，供两个入口复用。 */
+    private static Result importSessions(android.content.Context context, String deviceId,
+            List<Session> all, ZoneId zone, long windowStartMs, long windowEndMs) {
         ZoneId resolved = zone == null ? ZoneId.systemDefault() : zone;
         HealthRecordStore store = new HealthRecordStore(context);
         // 上次留下的痕迹先擦干净，不管这次有没有数据。
         long startMs = windowStartMs;
         long endMs = windowEndMs;
-        if (startMs <= 0 && !stages.isEmpty()) startMs = stages.get(0).startMs() - 1;
-        if (endMs <= 0 && !stages.isEmpty()) endMs = stages.get(stages.size() - 1).endMs() + 1;
+        if (startMs <= 0 && !all.isEmpty()) startMs = all.get(0).startMs() - 1;
+        if (endMs <= 0 && !all.isEmpty()) endMs = all.get(all.size() - 1).endMs() + 1;
         int purged = 0;
         if (startMs > 0 && endMs > startMs) {
             purged += store.purgeWindow(deviceId, "sleep_interval", startMs, endMs);
             purged += store.purgeWindow(deviceId, "sleep_stage", startMs, endMs);
         }
-        if (stages.isEmpty()) return new Result(0, 0, 0, purged);
+        if (all.isEmpty()) return new Result(0, 0, 0, purged);
 
         int sessions = 0;
         int skipped = 0;
         int records = 0;
-        for (Session session : sessions(stages)) {
+        for (Session session : all) {
             long from = session.startMs();
             long to = session.endMs();
             if (endMs > 0) to = Math.min(to, endMs);
-            // ★ 只看纯睡眠时长（见 MIN_SLEEP_MS 注释）：跨度和 coverage 都会把
-            // 「睡着但中途醒」的真午睡错杀 —— GT3 不为清醒时段出分期。
             if (session.sleepMs() < MIN_SLEEP_MS) {
                 skipped++;
                 continue;
@@ -212,6 +247,13 @@ public final class HuaweiSleepImporter {
             records += 1 + session.stages().size();
         }
         return new Result(sessions, skipped, records, purged);
+    }
+
+    public static Result enqueue(android.content.Context context, String deviceId,
+            List<FitnessData.MessageData.SleepResponse.SubContainer> containers, ZoneId zone,
+            long windowStartMs, long windowEndMs) {
+        return importSessions(context, deviceId, sessions(parse(containers)), zone,
+                windowStartMs, windowEndMs);
     }
 
     /** 一次睡眠：一条 interval + 每个分期一条 stage。 */

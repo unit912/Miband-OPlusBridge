@@ -64,7 +64,7 @@ public final class MyDevicesHook {
         // Min app and OS versions stay 0. Build 17.4 filters on the installed versionCode and ColorOS version, so a pinned 36 drops the card on a newer OS.
         Object app = deviceApp.getConstructor(String.class, String.class, long.class,
                         int.class, boolean.class, boolean.class, Boolean.class, deletion)
-                .newInstance("小米手环桥接", PACKAGE, 0L, 0,
+                .newInstance("腕桥", PACKAGE, 0L, 0,
                         true, true, Boolean.TRUE, deletion.getField("NONE").get(null));
         Method packageName = deviceApp.getMethod("getPackageName");
         Class<?> manager = Class.forName(MANAGER, false, hostLoader);

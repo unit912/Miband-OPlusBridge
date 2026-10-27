@@ -45,6 +45,15 @@ public class SendNotificationRequest extends Request {
         return new SendNotificationRequest(support, action);
     }
 
+    /**
+     * 通用 fire-and-forget 发包：任何已完成（{@code complete=true}）的华为报文都可用，
+     * 如音乐控制、免打扰、闹钟响铃等测试命令。同样不进响应认领表、不带超时。
+     */
+    public static SendNotificationRequest send(HuaweiSupportProvider support,
+            io.github.miam1ku.mibandoplusbridge.protocol.huawei.core.HuaweiPacket packet) {
+        return new SendNotificationRequest(support, packet);
+    }
+
     @Override
     protected List<byte[]> createRequest() throws RequestCreationException {
         try {

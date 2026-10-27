@@ -18,3 +18,12 @@ tools/
 work/
 scripts/_javac_out/
 *.log
+
+# 调屏时的临时产物（仓库根目录散落的截图与布局快照）
+/detail*.xml
+/detail*.png
+/devspace.xml
+/list*.png
+/icon_zoom.png
+/new_preview*.png
+/strap_preview.png

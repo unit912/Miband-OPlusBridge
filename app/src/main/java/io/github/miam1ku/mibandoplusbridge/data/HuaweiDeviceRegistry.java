@@ -43,6 +43,11 @@ public final class HuaweiDeviceRegistry {
     private static final String KEY_SLEEP_AT = "lastSleepAt";
     private static final String KEY_WATCHFACES = "watchfaces";
     private static final String KEY_WATCHFACES_AT = "watchfacesAt";
+    // 固件 / 硬件版本来自 DeviceConfig.ProductInfo（0x07），与小米链路经
+    // BandStateRepository.recordVerifiedDevice 写入的字段同名（verifiedFirmware /
+    // verifiedHardware），device-info 卡片直接读，无需改 UI。
+    private static final String KEY_FIRMWARE = "lastFirmware";
+    private static final String KEY_HARDWARE = "lastHardware";
 
     private HuaweiDeviceRegistry() {}
 
@@ -240,6 +245,30 @@ public final class HuaweiDeviceRegistry {
         return LocalPrefs.open(context, NAME).getLong(KEY_WATCHFACES_AT, 0L);
     }
 
+    /** 最近一次从 DeviceConfig.ProductInfo（0x07）读到的固件版本；从未读到为空串。 */
+    public static String firmware(Context context) {
+        return LocalPrefs.open(context, NAME).getString(KEY_FIRMWARE, "");
+    }
+
+    /** 最近一次读到的硬件版本；从未读到为空串。 */
+    public static String hardware(Context context) {
+        return LocalPrefs.open(context, NAME).getString(KEY_HARDWARE, "");
+    }
+
+    /**
+     * 记下固件 / 硬件版本。两个都来自 ProductInfo 响应；任一为空则跳过该字段，
+     * 不覆盖已有值。仅当两者至少其一非空才提交。
+     */
+    public static boolean noteFirmwareHardware(Context context, String firmware, String hardware) {
+        if ((firmware == null || firmware.isBlank()) && (hardware == null || hardware.isBlank())) {
+            return false;
+        }
+        LocalPrefs.Editor editor = LocalPrefs.open(context, NAME).edit();
+        if (firmware != null && !firmware.isBlank()) editor.putString(KEY_FIRMWARE, firmware);
+        if (hardware != null && !hardware.isBlank()) editor.putString(KEY_HARDWARE, hardware);
+        return editor.commit();
+    }
+
     // ------------------------------------------------------- 投影到 OPPO 侧
     //
     // 钩子层（OHealthDeviceHook / MyDevicesHook / OHealthStepWriter）只有
@@ -315,6 +344,14 @@ public final class HuaweiDeviceRegistry {
                 edit.putString("watchfaces", watchfaces)
                         .putLong("watchfacesAtMs", watchfacesAt(context));
             }
+            // 固件 / 硬件：与小米侧 BandStateRepository 写的字段同名，device-info
+            // 卡片直接读。ProductInfo（0x07）由 BandLiveService 会话建立后读取。
+            String firmware = firmware(context);
+            if (!firmware.isBlank()) edit.putString("verifiedFirmware", firmware);
+            String hardware = hardware(context);
+            if (!hardware.isBlank()) edit.putString("verifiedHardware", hardware);
+            // 上次同步：每次成功 publish 都刷新，让「上次同步」不再显示「无」。
+            edit.putLong("lastSyncAtMs", now);
             if (state.getLong("registeredAtMs", 0) <= 0) {
                 long provisioned = provisionedAt(context);
                 edit.putLong("registeredAtMs", provisioned > 0 ? provisioned : now);

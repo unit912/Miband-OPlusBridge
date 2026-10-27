@@ -9,15 +9,21 @@ import android.os.Looper;
 import android.util.Log;
 import android.widget.LinearLayout;
 import android.widget.TextView;
+import android.widget.Toast;
 import androidx.appcompat.app.AppCompatActivity;
 import io.github.miam1ku.mibandoplusbridge.data.BandStateRepository;
 import io.github.miam1ku.mibandoplusbridge.data.LocalPrefs;
+import io.github.miam1ku.mibandoplusbridge.data.WatchfaceBodies;
+import io.github.miam1ku.mibandoplusbridge.data.WatchfacePreviewRenderer;
 import io.github.miam1ku.mibandoplusbridge.protocol.BandNotificationCommand;
 import io.github.miam1ku.mibandoplusbridge.notify.FindPhone;
 import io.github.miam1ku.mibandoplusbridge.notify.PhoneDnd;
-import io.github.miam1ku.mibandoplusbridge.protocol.BandAlarmCommand;
 import io.github.miam1ku.mibandoplusbridge.protocol.BandDndCommand;
 import io.github.miam1ku.mibandoplusbridge.protocol.BandMusicCommand;
+import io.github.miam1ku.mibandoplusbridge.protocol.huawei.core.HuaweiPacket;
+import io.github.miam1ku.mibandoplusbridge.protocol.huawei.packets.Alarms;
+import io.github.miam1ku.mibandoplusbridge.protocol.huawei.packets.DeviceConfig;
+import io.github.miam1ku.mibandoplusbridge.protocol.huawei.packets.MusicControl;
 import io.github.miam1ku.mibandoplusbridge.service.BandLiveService;
 import io.github.miam1ku.mibandoplusbridge.ui.BridgeScreen;
 import java.time.Instant;
@@ -36,6 +42,8 @@ public final class LabActivity extends AppCompatActivity {
     private TextView info;
     private TextView session;
     private TextView result;
+    private final java.util.List<com.google.android.material.button.MaterialButton> bodyButtons =
+            new java.util.ArrayList<>();
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
@@ -89,26 +97,36 @@ public final class LabActivity extends AppCompatActivity {
         screen.overline(music, "音乐");
         screen.caption(music, "把手环上的播放信息刷成一条测试曲目。真正播放时会自动同步，手环按键会控制手机。");
         screen.setLastChildMargin(music, 0);
-        screen.filled("发送测试音乐", () -> send("测试音乐", BandMusicCommand.playback(
-                50, "测试音乐", "桥接", 12, 180, true), true));
+        screen.filled("发送测试音乐", this::sendTestMusic);
 
         LinearLayout dnd = screen.card();
         screen.overline(dnd, "免打扰");
-        screen.caption(dnd, "先发同步开关，再发当前手机免打扰状态。两包都发，不看型号。");
+        screen.caption(dnd, "把手机当前的免打扰开关同步到手表。两包都发，不看型号。");
         screen.setLastChildMargin(dnd, 0);
-        screen.filled("同步免打扰", () -> sendAll("免打扰",
-                BandDndCommand.mirror(PhoneDnd.currentFilter(this))));
+        screen.filled("同步免打扰", this::syncDnd);
 
         LinearLayout alarm = screen.card();
         screen.overline(alarm, "闹钟");
         screen.caption(alarm, "只测响铃、关闭和稍后响，不写入手环自己的闹钟列表。");
         screen.setLastChildMargin(alarm, 0);
-        screen.filled("测试闹钟响铃", () -> send("闹钟响铃",
-                BandAlarmCommand.operation(0, 1, (int) (System.currentTimeMillis() / 1000L), "测试闹钟"), true));
-        screen.outlined("测试关闭闹钟", () -> send("关闭闹钟",
-                BandAlarmCommand.operation(1, 1, -1, ""), true));
-        screen.outlined("测试稍后响", () -> send("稍后响",
-                BandAlarmCommand.operation(2, 1, (int) (System.currentTimeMillis() / 1000L), "测试闹钟"), true));
+        screen.filled("测试闹钟响铃", this::sendTestAlarmRing);
+        screen.outlined("测试关闭闹钟", this::sendTestAlarmClose);
+        screen.outlined("测试稍后响", this::sendTestAlarmSnooze);
+
+        LinearLayout bodyCard = screen.card();
+        screen.overline(bodyCard, "表盘机身");
+        screen.caption(bodyCard, "设备空间和健康里那块表的外壳。点选后约半分钟内自动重画，设备页下次刷新即换。");
+        screen.setLastChildMargin(bodyCard, 0);
+        android.widget.LinearLayout bodyGrid = new android.widget.LinearLayout(this);
+        bodyGrid.setOrientation(android.widget.LinearLayout.VERTICAL);
+        bodyCard.addView(bodyGrid);
+        for (int i = 0; i < WatchfaceBodies.count(); i++) {
+            final String key = WatchfaceBodies.key(i);
+            com.google.android.material.button.MaterialButton b =
+                    screen.outlined(bodyGrid, "", () -> pickBody(key));
+            bodyButtons.add(b);
+        }
+        refreshBodyButtons();
 
         LinearLayout extra = screen.card();
         screen.overline(extra, "其他");
@@ -212,8 +230,50 @@ public final class LabActivity extends AppCompatActivity {
         String detail = error == null ? "已确认送达手环。"
                 : ("发送失败：" + (error.getMessage() == null ? error.getClass().getSimpleName() : error.getMessage()));
         Log.i("OplusBandBridge", "LAB " + label + " " + (error == null ? "ok" : error.getClass().getSimpleName()));
-        setResultText(label + detail);
+        String msg = label + detail;
+        setResultText(msg);
+        toast(msg);
         refresh();
+    }
+
+    private void refreshBodyButtons() {
+        String current = WatchfaceBodies.selectedKey(this);
+        for (int i = 0; i < WatchfaceBodies.count(); i++) {
+            String key = WatchfaceBodies.key(i);
+            String label = key.equals(current)
+                    ? "✓ " + WatchfaceBodies.name(i)
+                    : WatchfaceBodies.name(i);
+            bodyButtonFor(i).setText(label);
+        }
+    }
+
+    private com.google.android.material.button.MaterialButton bodyButtonFor(int index) {
+        return bodyButtons.get(index);
+    }
+
+    private void pickBody(String key) {
+        if (!WatchfaceBodies.select(this, key)) {
+            setResultText("机身切换失败：未知选项。");
+            return;
+        }
+        refreshBodyButtons();
+        setResultText("已选「" + WatchfaceBodies.nameOf(key) + "」，正在重画表盘…");
+        worker.execute(() -> {
+            String message;
+            try {
+                WatchfacePreviewRenderer.render(this);
+                getContentResolver().notifyChange(
+                        io.github.miam1ku.mibandoplusbridge.integration.DeviceCardProvider.URI, null);
+                message = "已切换为「" + WatchfaceBodies.nameOf(key) + "」。设备空间/健康页刷新后生效。";
+            } catch (RuntimeException failure) {
+                message = "重画失败：" + failure.getClass().getSimpleName();
+            }
+            String text = message;
+            main.post(() -> {
+                if (isDestroyed()) return;
+                setResultText(text);
+            });
+        });
     }
 
     private void checkUpdate() {
@@ -246,6 +306,106 @@ public final class LabActivity extends AppCompatActivity {
                 }
             });
         });
+    }
+
+    // ---- 华为链路命令（GT3 等华为手表）----
+    // 这些命令不走小米 command 通道，而是经已认证的华为 SPP 会话 fire-and-forget 发送。
+
+    private void toast(String message) {
+        if (isDestroyed()) return;
+        Toast.makeText(this, message, Toast.LENGTH_SHORT).show();
+    }
+
+    /** 经华为会话发送一条已构造好的报文；会话未就绪或构造失败都给可见反馈。 */
+    private void sendHuawei(String label, io.github.miam1ku.mibandoplusbridge.protocol.huawei.core.HuaweiPacket packet) {
+        if (BandLiveService.huaweiParamsProvider() == null) {
+            String msg = label + "：华为会话未就绪。请先点「立即同步」，等手表连上后再试。";
+            setResultText(msg);
+            toast(msg);
+            return;
+        }
+        if (packet == null) {
+            String msg = label + "：构造报文失败。";
+            setResultText(msg);
+            toast(msg);
+            return;
+        }
+        setResultText("正在发送" + label + "…");
+        BandLiveService.sendHuaweiCommand(packet).whenComplete((ignored, error) -> main.post(() -> {
+            if (isDestroyed()) return;
+            String detail = error == null
+                    ? "已写入传输层（华为控制命令无语义回包）。"
+                    : ("发送失败：" + (error.getMessage() == null ? error.getClass().getSimpleName() : error.getMessage()));
+            Log.i("OplusBandBridge", "LAB " + label + " " + (error == null ? "ok" : error.getClass().getSimpleName()));
+            String msg = label + detail;
+            setResultText(msg);
+            toast(msg);
+            refresh();
+        }));
+    }
+
+    private void sendTestMusic() {
+        io.github.miam1ku.mibandoplusbridge.protocol.huawei.core.HuaweiPacket.ParamsProvider pp =
+                BandLiveService.huaweiParamsProvider();
+        if (pp == null) { sendHuawei("测试音乐", null); return; }
+        io.github.miam1ku.mibandoplusbridge.protocol.huawei.packets.MusicControl.MusicInfo.Request req =
+                new io.github.miam1ku.mibandoplusbridge.protocol.huawei.packets.MusicControl.MusicInfo.Request(
+                        pp, "桥接测试", "实验室测试曲", (byte) 1, (byte) 10, (byte) 6);
+        sendHuawei("测试音乐", req);
+    }
+
+    private void syncDnd() {
+        io.github.miam1ku.mibandoplusbridge.protocol.huawei.core.HuaweiPacket.ParamsProvider pp =
+                BandLiveService.huaweiParamsProvider();
+        if (pp == null) { sendHuawei("同步免打扰", null); return; }
+        int filter = PhoneDnd.currentFilter(this);
+        boolean enable = filter != PhoneDnd.ALL;
+        byte[] start = enable ? nowBytes(0) : new byte[]{0, 0, 0};
+        byte[] end = enable ? nowBytes(60) : new byte[]{0, 0, 0};
+        io.github.miam1ku.mibandoplusbridge.protocol.huawei.packets.DeviceConfig.DndAddRequest req =
+                new io.github.miam1ku.mibandoplusbridge.protocol.huawei.packets.DeviceConfig.DndAddRequest(
+                        pp, enable, start, end, 0x7F, 0, false);
+        sendHuawei("同步免打扰（" + (enable ? "开" : "关") + "）", req);
+    }
+
+    private void sendTestAlarmRing() {
+        io.github.miam1ku.mibandoplusbridge.protocol.huawei.core.HuaweiPacket.ParamsProvider pp =
+                BandLiveService.huaweiParamsProvider();
+        if (pp == null) { sendHuawei("测试闹钟响铃", null); return; }
+        java.time.LocalTime now = java.time.LocalTime.now();
+        io.github.miam1ku.mibandoplusbridge.protocol.huawei.packets.Alarms.EventAlarmsRequest req =
+                new io.github.miam1ku.mibandoplusbridge.protocol.huawei.packets.Alarms.EventAlarmsRequest(pp);
+        req.addEventAlarm(new io.github.miam1ku.mibandoplusbridge.protocol.huawei.packets.Alarms.EventAlarm(
+                (byte) 1, true, (byte) now.getHour(), (byte) now.getMinute(), (byte) 0, "测试闹钟"));
+        sendHuawei("测试闹钟响铃", req);
+    }
+
+    private void sendTestAlarmClose() {
+        io.github.miam1ku.mibandoplusbridge.protocol.huawei.core.HuaweiPacket.ParamsProvider pp =
+                BandLiveService.huaweiParamsProvider();
+        if (pp == null) { sendHuawei("测试关闭闹钟", null); return; }
+        io.github.miam1ku.mibandoplusbridge.protocol.huawei.packets.Alarms.EventAlarmsRequest req =
+                new io.github.miam1ku.mibandoplusbridge.protocol.huawei.packets.Alarms.EventAlarmsRequest(pp);
+        req.addEventAlarm(new io.github.miam1ku.mibandoplusbridge.protocol.huawei.packets.Alarms.EventAlarm(
+                (byte) 1, false, (byte) 0, (byte) 0, (byte) 0, "测试闹钟"));
+        sendHuawei("测试关闭闹钟", req);
+    }
+
+    private void sendTestAlarmSnooze() {
+        io.github.miam1ku.mibandoplusbridge.protocol.huawei.core.HuaweiPacket.ParamsProvider pp =
+                BandLiveService.huaweiParamsProvider();
+        if (pp == null) { sendHuawei("测试稍后响", null); return; }
+        java.time.LocalTime later = java.time.LocalTime.now().plusMinutes(5);
+        io.github.miam1ku.mibandoplusbridge.protocol.huawei.packets.Alarms.EventAlarmsRequest req =
+                new io.github.miam1ku.mibandoplusbridge.protocol.huawei.packets.Alarms.EventAlarmsRequest(pp);
+        req.addEventAlarm(new io.github.miam1ku.mibandoplusbridge.protocol.huawei.packets.Alarms.EventAlarm(
+                (byte) 1, true, (byte) later.getHour(), (byte) later.getMinute(), (byte) 0, "测试闹钟"));
+        sendHuawei("测试稍后响", req);
+    }
+
+    private static byte[] nowBytes(int plusMinutes) {
+        java.time.LocalTime t = java.time.LocalTime.now().plusMinutes(plusMinutes);
+        return new byte[]{(byte) t.getHour(), (byte) t.getMinute(), 0};
     }
 
     private void setResultText(String value) {

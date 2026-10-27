@@ -18,10 +18,13 @@ import io.github.miam1ku.mibandoplusbridge.protocol.huawei.service.HuaweiSupport
  *   <li><b>0x0D 的 count 是「窗口内第几条」，不是「要几条」。</b>窗口由最近一次
  *       0x0C 决定，记录在窗口内按时间从早到晚编号，GT3 上实测为 1-based。
  *       真机：24h 窗口得到 count=4，取 1 是 08:44 那段、取 3 是 13:53 那段。</li>
- *   <li><b>最后一条编号是「当前尚未结束的一段」</b>，取它只会拿到
- *       {@code timestamp = 000000000000} 的空壳，所以只取 1 … count-1。
- *       Gadgetbridge 用 0-based 编到 {@code count-1}，取满 count 条 —— 它因此
- *       会收到那条空壳，这里跳过它。</li>
+ *   <li><b>曾经假设「最后一条编号是尚未结束的一段」，只取 1 … count-1。</b>
+ *       但真机实测（2026-10-23）整夜 5.7h 睡眠恰恰落在最后一条（count=5 时的第 5 条），
+ *       按旧逻辑整场被丢弃、OPPO 睡眠页永远缺这一夜。现改为<b>总是取满 1 … count</b>，
+ *       {@link io.github.miam1ku.mibandoplusbridge.data.HuaweiSleepImporter#parse} 已把
+ *       {@code startSec <= 0} 的空壳段直接跳过，所以最后一条若真是未结束空壳也只是多拉一条
+ *       无害数据，若为已完成睡眠则正好找回（如整夜）。Gadgetbridge 用 0-based 编到
+ *       {@code count-1} 取满 count 条，与本实现殊途同归。</li>
  *   <li><b>每条记录是一串 0x83 子容器，每个子容器 = 一段睡眠分期。</b>
  *       6 字节时间戳是「前 4 字节起始秒 + 后 2 字节时长，单位分钟」
  *       （Gadgetbridge {@code GetSleepDataRequest}：
@@ -129,8 +132,8 @@ public class GetSleepDataRequest extends Request {
                     (FitnessData.MessageCount.Response) receivedPacket;
             int count = response.count & 0xFFFF;
             LOG.info("SleepData count={} window=[{}, {}]", count, startSec, endSec);
-            if (count <= 1) {
-                // 只有一条时那条几乎肯定是「尚未结束的一段」，取它没有意义。
+            if (count <= 0) {
+                // 真·零条：窗口内没有任何睡眠，无需发起第二阶段。
                 if (listener != null) {
                     listener.onSleep(count, new ArrayList<>());
                 }
@@ -156,8 +159,10 @@ public class GetSleepDataRequest extends Request {
         LOG.info("SleepData record={}/{} segments={}", knownIndex, knownTotal, segments.size());
 
         // 还剩记录没取：串下一个实例。注意不能用同一个实例重复 perform --
-        // timeoutWatcher 不能 start 两次。
-        if (knownIndex + 1 < knownTotal) {
+        // timeoutWatcher 不能 start 两次。末条（knownIndex == knownTotal）也要取：
+        // 整夜睡眠常落在最后一条，旧逻辑 knownIndex+1<knownTotal 会把它整场丢弃。
+        // 末条若是未结束空壳，parse() 会按零时间戳过滤，不会引入脏数据。
+        if (knownIndex + 1 <= knownTotal) {
             LOG.info("SleepData requesting record {} of {}", knownIndex + 1, knownTotal);
             nextRequest(new GetSleepDataRequest(supportProvider, startSec, endSec, listener,
                     knownIndex + 1, knownTotal, all));

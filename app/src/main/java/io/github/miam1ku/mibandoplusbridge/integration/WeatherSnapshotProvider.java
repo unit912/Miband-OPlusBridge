@@ -12,6 +12,7 @@ import android.os.Process;
 import android.os.SystemClock;
 import android.util.Log;
 import io.github.miam1ku.mibandoplusbridge.HostIdentity;
+import io.github.miam1ku.mibandoplusbridge.data.HuaweiDeviceRegistry;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -34,9 +35,12 @@ public final class WeatherSnapshotProvider extends ContentProvider {
             return switch (method) {
                 case "requestRefresh" -> {
                     requireSelf(self);
-                    // No weather polling or sending while the official app owns the band.
-                    if (!"NATIVE".equals(io.github.miam1ku.mibandoplusbridge.data.LocalPrefs.open(getContext(), "ownership")
-                            .getString("mode", "OFFICIAL"))) yield status("OFFICIAL_MODE");
+                    // 小米分支：官方接管时不允许轮询天气。华为分支用 OHealth 自己的天气，
+                    // 没有「接管」概念，只要存在已登记的华为设备就放行。
+                    var owner = io.github.miam1ku.mibandoplusbridge.data.LocalPrefs.open(getContext(), "ownership");
+                    boolean nativeOwned = "NATIVE".equals(owner.getString("mode", "OFFICIAL"));
+                    boolean huaweiActive = HuaweiDeviceRegistry.provisioned(getContext());
+                    if (!nativeOwned && !huaweiActive) yield status("OFFICIAL_MODE");
                     getContext().grantUriPermission(HEALTH, URI, Intent.FLAG_GRANT_READ_URI_PERMISSION);
                     if (isPending(prefs)) {
                         Bundle existing = status("WEATHER_REQUESTED");

@@ -18,6 +18,8 @@ package io.github.miam1ku.mibandoplusbridge.protocol.huawei.packets;
 
 import java.nio.ByteBuffer;
 
+import io.github.miam1ku.mibandoplusbridge.data.HuaweiLogger;
+
 import io.github.miam1ku.mibandoplusbridge.protocol.huawei.core.HuaweiCrypto;
 import io.github.miam1ku.mibandoplusbridge.protocol.huawei.core.HuaweiPacket;
 import io.github.miam1ku.mibandoplusbridge.protocol.huawei.core.HuaweiTLV;
@@ -29,6 +31,8 @@ import io.github.miam1ku.mibandoplusbridge.protocol.huawei.core.HuaweiTLV;
  */
 public class FileDownloadService2C {
     public static final int id = 0x2c;
+
+    private static final HuaweiLogger LOG = HuaweiLogger.of(FileDownloadService2C.class);
 
     public enum FileType {
         SLEEP_STATE,
@@ -230,7 +234,9 @@ public class FileDownloadService2C {
         @Override
         public void parseTlv() throws ParseException {
             ByteBuffer byteBuffer;
-            if (this.payload[2] == 0x7c && this.payload[3] == 0x01 && this.payload[4] == 0x01) {
+            boolean encrypted = this.payload.length > 4
+                    && this.payload[2] == 0x7c && this.payload[3] == 0x01 && this.payload[4] == 0x01;
+            if (encrypted) {
                 // Encrypted TLV, so we decrypt first
                 this.tlv = new HuaweiTLV();
                 this.tlv.parse(this.payload, 2, this.payload.length - 2);
@@ -243,12 +249,17 @@ public class FileDownloadService2C {
             } else {
                 byteBuffer = ByteBuffer.wrap(this.payload, 2, this.payload.length - 2);
             }
+            int decoded = byteBuffer.remaining();
 
             fileId = byteBuffer.get();
             offset = byteBuffer.getInt();
             unknown = byteBuffer.get();
             data = new byte[byteBuffer.remaining()];
             System.arraycopy(byteBuffer.array(), byteBuffer.position(), data, 0, byteBuffer.remaining());
+            // 2026-10-26: 2C 块数据诊断。此前 0x05 明明到达并被 BlockListener 派发，
+            // 却因 data 为空被静默丢弃、最终 watchdog 超时，这里把每一步都打出来。
+            LOG.info("HUAWEI_2C_BLOCK payloadLen={} encrypted={} decoded={} fileId={} offset={} dataLen={}",
+                    this.payload.length, encrypted, decoded, fileId, offset, data.length);
         }
     }
 

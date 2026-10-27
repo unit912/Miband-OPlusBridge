@@ -12,16 +12,24 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.ServiceInfo;
+import android.os.Bundle;
 import android.os.IBinder;
+import android.util.Log;
 import io.github.miam1ku.mibandoplusbridge.data.BandStateRepository;
 import io.github.miam1ku.mibandoplusbridge.data.HuaweiDeviceRegistry;
+import io.github.miam1ku.mibandoplusbridge.data.HuaweiStepsImporter;
+import io.github.miam1ku.mibandoplusbridge.integration.WeatherSnapshotProvider;
+import io.github.miam1ku.mibandoplusbridge.protocol.BandWeatherEncoder;
+import io.github.miam1ku.mibandoplusbridge.protocol.huawei.packets.Weather;
 import io.github.miam1ku.mibandoplusbridge.protocol.SppDiagnosticClient;
 import io.github.miam1ku.mibandoplusbridge.protocol.huawei.br.HuaweiBrTransport;
 import io.github.miam1ku.mibandoplusbridge.protocol.huawei.core.HuaweiDeviceType;
+import io.github.miam1ku.mibandoplusbridge.protocol.huawei.core.HuaweiPacket;
 import io.github.miam1ku.mibandoplusbridge.protocol.huawei.packets.FitnessData;
 import io.github.miam1ku.mibandoplusbridge.protocol.huawei.packets.Notifications;
 import io.github.miam1ku.mibandoplusbridge.protocol.huawei.requests.GetFitnessDataRequest;
 import io.github.miam1ku.mibandoplusbridge.protocol.huawei.requests.GetFitnessTotalsRequest;
+import io.github.miam1ku.mibandoplusbridge.protocol.huawei.requests.GetProductInfoRequest;
 import io.github.miam1ku.mibandoplusbridge.protocol.huawei.requests.GetSleepDataRequest;
 import io.github.miam1ku.mibandoplusbridge.protocol.huawei.service.HuaweiIdentityStore;
 import io.github.miam1ku.mibandoplusbridge.protocol.huawei.service.HuaweiSupportProvider;
@@ -34,6 +42,8 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.CompletionStage;
+import java.util.concurrent.CompletableFuture;
 
 /** Keeps one authenticated SPP session for the whole NATIVE ownership period and reconnects after the link drops. */
 public final class BandLiveService extends Service {
@@ -324,18 +334,33 @@ public final class BandLiveService extends Service {
     public static java.util.concurrent.CompletionStage<Void> requestWeather(Context context,
             io.github.miam1ku.mibandoplusbridge.protocol.BandWeatherEncoder.Sample sample, boolean inspect) {
         BandLiveService live = instance;
-        if (live == null || live.stopRequested || live.commands == null
-                || !new BandStateRepository(context).isRegistered()) {
-            return java.util.concurrent.CompletableFuture.failedFuture(new IllegalStateException("LIVE_SESSION_REQUIRED"));
+        if (live == null || live.stopRequested) {
+            return java.util.concurrent.CompletableFuture.failedFuture(new IllegalStateException("LIVE_SESSION_UNAVAILABLE"));
         }
-        return inspect ? live.weatherSync.inspectCities(sample) : live.weatherSync.send(sample);
+        if (live.commands != null) {
+            // 小米分支
+            if (!new BandStateRepository(context).isRegistered()) {
+                return java.util.concurrent.CompletableFuture.failedFuture(new IllegalStateException("LIVE_SESSION_REQUIRED"));
+            }
+            return inspect ? live.weatherSync.inspectCities(sample) : live.weatherSync.send(sample);
+        }
+        // 华为分支：不经小米命令通道，直接构华为天气报文。inspect 对华为无意义（按地点名推送，无城市码清单）。
+        HuaweiSupportProvider huawei = live.huaweiProvider;
+        if (huawei == null || !huawei.isAuthenticated()) {
+            return java.util.concurrent.CompletableFuture.failedFuture(new IllegalStateException("LIVE_SESSION_UNAVAILABLE"));
+        }
+        return live.sendHuaweiWeather(sample);
     }
 
     public static void refreshWeather(Context context) {
         BandLiveService live = instance;
-        if (live != null && !live.stopRequested && new BandStateRepository(context).isRegistered()) {
+        if (live == null || live.stopRequested || !new BandStateRepository(context).isRegistered()) return;
+        if (live.commands != null) {
             live.weatherSync.refreshAndSend();
+            return;
         }
+        // 华为分支：读最新天气快照后推送到手表。
+        live.refreshHuaweiWeather();
     }
 
     public static boolean notificationSessionReady(Context context) {
@@ -764,6 +789,122 @@ public final class BandLiveService extends Service {
                         ? Notifications.NotificationType.email
                         : Notifications.NotificationType.generic;
         }
+    }
+
+    /**
+     * 华为链路的通用命令出口：把已构造好的华为报文 fire-and-forget 发到手表。
+     * 用于协议测试里的音乐 / 免打扰 / 闹钟响铃等命令。返回的 CompletionStage 在帧
+     * 写入传输层后即为完成（华为通知/控制命令无语义回包，等响应不如直接发）。
+     * 会话未就绪则立即失败。
+     */
+    public static java.util.concurrent.CompletionStage<Void> sendHuaweiCommand(
+            io.github.miam1ku.mibandoplusbridge.protocol.huawei.core.HuaweiPacket packet) {
+        BandLiveService live = instance;
+        HuaweiSupportProvider huawei = live == null ? null : live.huaweiProvider;
+        if (huawei == null || !huawei.isAuthenticated() || packet == null) {
+            return java.util.concurrent.CompletableFuture.failedFuture(
+                    new IllegalStateException("NOTIFICATION_SESSION_UNAVAILABLE"));
+        }
+        try {
+            io.github.miam1ku.mibandoplusbridge.protocol.huawei.requests.SendNotificationRequest
+                    .send(huawei, packet).doPerform();
+            return java.util.concurrent.CompletableFuture.completedFuture(null);
+        } catch (java.io.IOException e) {
+            return java.util.concurrent.CompletableFuture.failedFuture(e);
+        }
+    }
+
+    /** 当前华为会话的 ParamsProvider；未连接或会话未认证返回 null。 */
+    public static io.github.miam1ku.mibandoplusbridge.protocol.huawei.core.HuaweiPacket.ParamsProvider
+            huaweiParamsProvider() {
+        BandLiveService live = instance;
+        HuaweiSupportProvider huawei = live == null ? null : live.huaweiProvider;
+        return huawei == null || !huawei.isAuthenticated() ? null : huawei.getParamsProvider();
+    }
+
+    /**
+     * 华为分支天气推送：走完整官方链（开会话 → 温标 → 三张能力位图 → 当前天气 → 预报）。
+     *
+     * <p>只发 0x09/0x02/0x01 是不够的：能力位图必须从手表的响应里读回来，
+     * 否则 {@link io.github.miam1ku.mibandoplusbridge.protocol.huawei.packets.Weather.Settings}
+     * 全靠猜，手表不认整条链，表现就是「天气暂不可用」。
+     */
+    CompletionStage<Void> sendHuaweiWeather(BandWeatherEncoder.Sample sample) {
+        CompletableFuture<Void> result = new CompletableFuture<>();
+        coordinator.execute(() -> {
+            HuaweiSupportProvider huawei = huaweiProvider;
+            if (huawei == null || !huawei.isAuthenticated()) {
+                result.completeExceptionally(new IllegalStateException("LIVE_SESSION_UNAVAILABLE"));
+                return;
+            }
+            try {
+                io.github.miam1ku.mibandoplusbridge.protocol.huawei.requests.HuaweiWeatherChain
+                        .send(huawei, sample, this::recordWeatherDelivered);
+                result.complete(null);
+            } catch (RuntimeException e) {
+                result.completeExceptionally(new IllegalStateException("WEATHER_DATA_INVALID"));
+            }
+        });
+        return result;
+    }
+
+    /**
+     * 手表主动要天气（0x0F/0x04，TLV 0x7f = 0x186AA）。
+     *
+     * <p>运行在 socket 读线程上，因此这里只做一次本地快照读取来判定能不能推，
+     * 真正的协议链交给协调线程。返回 {@code false} 时监听器会替我们回一条 OK。
+     */
+    private boolean onWatchWeatherRequest() {
+        HuaweiSupportProvider huawei = huaweiProvider;
+        if (huawei == null || !huawei.isAuthenticated()) return false;
+        BandWeatherEncoder.Sample sample = latestWeatherSample();
+        if (sample == null) {
+            io.github.miam1ku.mibandoplusbridge.protocol.huawei.requests.HuaweiWeatherChain
+                    .sendUnavailable(huawei);
+            return true;
+        }
+        coordinator.execute(() -> {
+            HuaweiSupportProvider live = huaweiProvider;
+            if (live == null || !live.isAuthenticated()) return;
+            io.github.miam1ku.mibandoplusbridge.protocol.huawei.requests.HuaweiWeatherChain
+                    .send(live, sample, this::recordWeatherDelivered);
+        });
+        return true;
+    }
+
+    /** 读一份仍然新鲜的天气快照；过期或缺失返回 {@code null}。 */
+    private BandWeatherEncoder.Sample latestWeatherSample() {
+        try {
+            Bundle response = getContentResolver()
+                    .call(WeatherSnapshotProvider.URI, "getSnapshot", null, null);
+            return response == null ? null : WeatherSync.freshSample(response);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** 华为分支没有城市码清单，发送成功后直接记录确认，状态页据此提示已在手环核对。 */
+    private void recordWeatherDelivered() {
+        try {
+            var edit = getSharedPreferences("weather-sync", 0).edit()
+                    .putString("status", "WEATHER_TRANSPORT_CONFIRMED")
+                    .putLong("confirmedAtMs", System.currentTimeMillis());
+            edit.apply();
+            getContentResolver().notifyChange(
+                    io.github.miam1ku.mibandoplusbridge.integration.WeatherSnapshotProvider.UPDATED, null);
+        } catch (RuntimeException ignored) { }
+    }
+
+    /** 华为分支：读最新已获取天气快照后走完整链推送（idle 轮询触发）。 */
+    void refreshHuaweiWeather() {
+        coordinator.execute(() -> {
+            HuaweiSupportProvider huawei = huaweiProvider;
+            if (huawei == null || !huawei.isAuthenticated()) return;
+            BandWeatherEncoder.Sample sample = latestWeatherSample();
+            if (sample == null) return;
+            io.github.miam1ku.mibandoplusbridge.protocol.huawei.requests.HuaweiWeatherChain
+                    .send(huawei, sample, this::recordWeatherDelivered);
+        });
     }
 
     static boolean suppressForDnd(
@@ -1207,6 +1348,31 @@ public final class BandLiveService extends Service {
      * record 2/5 无声挂死；同命令链（0x0A/0x0B）并发还会在响应分发处
      * 先到先认领互相抢包。
      */
+    /**
+     * 认证完成后读一次产品信息（DeviceConfig / ProductInfo，0x07），把固件 / 硬件版本
+     * 落进 HuaweiDeviceRegistry，设备信息卡片才不再显示「未读取」。这是一条独立的
+     * 读请求（serviceId 0x01，与数据链 serviceId 0x07 互不抢响应），与下面的串行
+     * 数据链并行发起不会撞车。
+     */
+    private void readHuaweiProductInfo(final HuaweiSupportProvider provider) {
+        GetProductInfoRequest req = new GetProductInfoRequest(provider);
+        req.setFinalizeReq(new io.github.miam1ku.mibandoplusbridge.protocol.huawei.requests
+                .Request.RequestCallback() {
+            @Override public void call() { }
+            @Override public void handleException(
+                    io.github.miam1ku.mibandoplusbridge.protocol.huawei.requests
+                            .Request.ResponseParseException e) {
+                Log.i("OplusBandBridge", "HUAWEI_PRODUCT_INFO_FAILED "
+                        + (e == null ? "" : e.getMessage()));
+            }
+        });
+        try {
+            req.doPerform();
+        } catch (IOException e) {
+            Log.i("OplusBandBridge", "HUAWEI_PRODUCT_INFO_FAILED " + e.getMessage());
+        }
+    }
+
     private void runSerialStage(final HuaweiSupportProvider provider,
             final AtomicBoolean finalized, final long epoch, final int index) {
         if (finalized.get() || epoch != sessionEpoch) return;
@@ -1257,6 +1423,13 @@ public final class BandLiveService extends Service {
                                         + " calories=" + calories + " distance=" + distance);
                         HuaweiDeviceRegistry.noteSteps(BandLiveService.this, steps);
                         HuaweiDeviceRegistry.publish(BandLiveService.this);
+                        try {
+                            String deviceId = HuaweiDeviceRegistry.deviceId(BandLiveService.this);
+                            if (deviceId != null && !deviceId.isBlank()) {
+                                HuaweiStepsImporter.enqueueDayTotal(BandLiveService.this, deviceId,
+                                        steps, calories, distance, java.time.ZoneId.systemDefault());
+                            }
+                        } catch (Throwable ignored) { }
                         advance.run();
                     }
 
@@ -1506,16 +1679,19 @@ public final class BandLiveService extends Service {
         sleepPullSinceMs = now;
         io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this,
                 "HUAWEI_SLEEP_PULL gen=" + gen);
+        // 24h 窗口足够覆盖「昨夜→今晨」整夜睡眠（夜眠结束时间仍在窗口内）。
         provider.readSleep(24 * 3600, new GetSleepDataRequest.SleepListener() {
             @Override
             public void onSleep(int total,
                     java.util.List<FitnessData.MessageData.SleepResponse.SubContainer> segments) {
+                // 0x0D 小睡已到；整夜睡眠主体走 0x2C 文件通道，busy 标志在 0x2C
+                // 收尾后由 finishSleep() 释放 —— 否则 0x2C 帧会与 0x07 拉取在
+                // 同一条 RFCOMM 上交错，触发手表静默丢响应（2026-10-14 实测教训）。
                 if (sleepPullGen == gen) {
-                    sleepPullBusy.set(false);
                     sleepPulledOkAtMs = System.currentTimeMillis();
                 }
                 if (finalized.get() || epoch != sessionEpoch) return;
-                handleSleepOnce(finalized, epoch, total, segments, advance);
+                handleSleepOnce(provider, finalized, epoch, total, segments, advance);
             }
 
             @Override
@@ -1556,7 +1732,9 @@ public final class BandLiveService extends Service {
      * <p>回调来自 transport 的读线程，而这里要开 SQLite 写，必须挪到后台线程，
      * 否则会把蓝牙读线程焊在读缓冲区上。
      */
-    private void handleSleepOnce(java.util.concurrent.atomic.AtomicBoolean finalized, long epoch,
+    private void handleSleepOnce(
+            io.github.miam1ku.mibandoplusbridge.protocol.huawei.service.HuaweiSupportProvider provider,
+            java.util.concurrent.atomic.AtomicBoolean finalized, long epoch,
             int total,
             java.util.List<io.github.miam1ku.mibandoplusbridge.protocol.huawei.packets
                     .FitnessData.MessageData.SleepResponse.SubContainer> segments,
@@ -1591,24 +1769,187 @@ public final class BandLiveService extends Service {
             io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(service,
                     "HUAWEI_SLEEP records=" + total + " segments=" + stages.size()
                             + " sessions=" + sessions.size());
-            long now = System.currentTimeMillis();
-            io.github.miam1ku.mibandoplusbridge.data.HuaweiSleepImporter.Result queued =
-                    io.github.miam1ku.mibandoplusbridge.data.HuaweiSleepImporter.enqueue(
-                            service, HuaweiDeviceRegistry.deviceId(service), copy,
-                            java.time.ZoneId.systemDefault(), now - 24L * 3_600_000L, now);
-            io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(service,
-                    "HUAWEI_SLEEP_IMPORT sessions=" + queued.sessions()
-                            + " skipped=" + queued.skipped() + " records=" + queued.records()
-                            + " purged=" + queued.purged());
-            if (finalized.get() || epoch != sessionEpoch) return;
-            if (HuaweiDeviceRegistry.noteSleep(service, lastStart, lastEnd)) {
-                HuaweiDeviceRegistry.publish(service);
+            // 0x0D 小睡的「最近一次睡眠」暂存，0x2C 夜眠覆盖后取更晚的结束。
+            final long[] last = {lastStart, lastEnd};
+            final long now = System.currentTimeMillis();
+            final long windowStartMs = now - 24L * 3_600_000L;
+            final long windowEndMs = now;
+            // TruSleep 文件下载窗口：GT3 的 sleep_state 文件按「上次同步锚点」组织，
+            // 24h 滚动窗口会让 init 报空（实测 fileSize=0）。对齐 GB：首同步从
+            // 2000-01-01 起拉全量，之后用 lastSync。这里先用 30 天宽窗做实证，
+            // 若 2C 回报非空则证明是窗口锚点问题。
+            final long truStartMs = now - 30L * 24 * 3_600_000L;
+            final String deviceId = HuaweiDeviceRegistry.deviceId(service);
+            // ★ TruSleep 专项（2026-10-23）：整夜睡眠走 0x2C 文件通道，必须先把
+            // 0x2C 文件拉回、解析出夜眠区间，再与 0x0D 小睡合并入队。0x2C 全程
+            // 复用 sleepPullBusy，收尾由 finishSleep() 释放并推进链。
+            final Runnable startTruSleep = () -> {
+            io.github.miam1ku.mibandoplusbridge.protocol.huawei.service
+                    .HuaweiSleepFileDownload download =
+                    new io.github.miam1ku.mibandoplusbridge.protocol.huawei.service
+                            .HuaweiSleepFileDownload(provider,
+                            (int) (truStartMs / 1000L), (int) (windowEndMs / 1000L),
+                            new io.github.miam1ku.mibandoplusbridge.protocol.huawei.service
+                                    .HuaweiSleepFileDownload.Callback() {
+                                @Override
+                                public void onComplete(byte[] data) {
+                                    java.util.List<io.github.miam1ku.mibandoplusbridge.data
+                                            .HuaweiTruSleepParser.TruSleepInterval> tru =
+                                            io.github.miam1ku.mibandoplusbridge.data
+                                                    .HuaweiTruSleepParser.parseState(data);
+                                    StringBuilder iv = new StringBuilder();
+                                    for (io.github.miam1ku.mibandoplusbridge.data
+                                            .HuaweiTruSleepParser.TruSleepInterval t : tru) {
+                                        iv.append(sleepClock(t.startSec() * 1000L)).append("-")
+                                                .append(sleepClock(t.endSec() * 1000L))
+                                                .append(" ");
+                                    }
+                                    io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(
+                                            service, "HUAWEI_TRUSLEEP intervals=" + tru.size()
+                                                    + " " + iv);
+                                    io.github.miam1ku.mibandoplusbridge.data.HuaweiSleepImporter
+                                            .Result queued = io.github.miam1ku.mibandoplusbridge
+                                            .data.HuaweiSleepImporter.enqueue(service, deviceId,
+                                            copy, tru, java.time.ZoneId.systemDefault(),
+                                            windowStartMs, windowEndMs);
+                                    io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(
+                                            service, "HUAWEI_SLEEP_IMPORT sessions="
+                                                    + queued.sessions() + " skipped="
+                                                    + queued.skipped() + " records="
+                                                    + queued.records() + " purged="
+                                                    + queued.purged());
+                                    long fStart = last[0], fEnd = last[1];
+                                    for (io.github.miam1ku.mibandoplusbridge.data
+                                            .HuaweiTruSleepParser.TruSleepInterval t : tru) {
+                                        if (t.endSec() * 1000L > fEnd) {
+                                            fStart = t.startSec() * 1000L;
+                                            fEnd = t.endSec() * 1000L;
+                                        }
+                                    }
+                                    if (HuaweiDeviceRegistry.noteSleep(service, fStart, fEnd)) {
+                                        HuaweiDeviceRegistry.publish(service);
+                                    }
+                                    finishSleep(finalized, epoch, advance);
+                                }
+
+                                @Override
+                                public void onError(String message) {
+                                    io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(
+                                            service, "HUAWEI_TRUSLEEP_FAILED " + message);
+                                    // 0x2C 失败：退化为只写 0x0D 小睡，不让夜眠缺失
+                                    // 把白天小睡也拖没。
+                                    io.github.miam1ku.mibandoplusbridge.data.HuaweiSleepImporter
+                                            .Result queued = io.github.miam1ku.mibandoplusbridge
+                                            .data.HuaweiSleepImporter.enqueue(service, deviceId,
+                                            copy, java.time.ZoneId.systemDefault(),
+                                            windowStartMs, windowEndMs);
+                                    io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(
+                                            service, "HUAWEI_SLEEP_IMPORT sessions="
+                                                    + queued.sessions() + " skipped="
+                                                    + queued.skipped() + " records="
+                                                    + queued.records() + " purged="
+                                                    + queued.purged());
+                                    if (HuaweiDeviceRegistry.noteSleep(service, last[0], last[1])) {
+                                        HuaweiDeviceRegistry.publish(service);
+                                    }
+                                    finishSleep(finalized, epoch, advance);
+                                }
+                            });
+            download.start();
+            };
+            // 0x07 0x16 SetTruSleep(true)：GB 在下载睡眠文件前必发；GT3 的 TruSleep
+            // 文件通道只在手表侧已启用 TruSleep 时才有数据，否则 2C init 恒定报空。
+            // 启用具有持久性（手表端保留），每次睡眠拉取前重发一次无副作用。
+            final Runnable enableTruSleepThenDownload = () -> {
+                io.github.miam1ku.mibandoplusbridge.protocol.huawei.requests
+                        .SetTruSleepRequest setReq =
+                        new io.github.miam1ku.mibandoplusbridge.protocol.huawei.requests
+                                .SetTruSleepRequest(provider, true);
+                setReq.setFinalizeReq(new io.github.miam1ku.mibandoplusbridge.protocol.huawei.requests
+                        .Request.RequestCallback(provider) {
+                            @Override
+                            public void call(io.github.miam1ku.mibandoplusbridge.protocol.huawei
+                                    .requests.Request request) {
+                                io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(service,
+                                        "HUAWEI_TRUSLEEP_ENABLED ok");
+                                startTruSleep.run();
+                            }
+
+                            @Override
+                            public void handleException(io.github.miam1ku.mibandoplusbridge
+                                    .protocol.huawei.requests.Request request,
+                                    io.github.miam1ku.mibandoplusbridge.protocol.huawei.requests
+                                            .Request.ResponseParseException e) {
+                                io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(service,
+                                        "HUAWEI_TRUSLEEP_ENABLED_FAILED " + e.getMessage());
+                                startTruSleep.run();
+                            }
+                        });
+                try {
+                    setReq.doPerform();
+                } catch (java.io.IOException e) {
+                    io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(service,
+                            "HUAWEI_TRUSLEEP_ENABLED_FAILED send: " + e.getMessage());
+                    startTruSleep.run();
+                }
+            };
+            // 0x01 0x31 SettingRelated 能力探针（GB 同款）：手表在此声明
+            // truSleepNewSync 位图，决定睡眠文件走 2C 新同步还是 0x0A 旧同步。
+            // 桥接此前从未发过该请求，先记录实证再发起下载；探针失败不阻塞。
+            io.github.miam1ku.mibandoplusbridge.protocol.huawei.requests
+                    .GetSettingRelatedRequest probe =
+                    new io.github.miam1ku.mibandoplusbridge.protocol.huawei.requests
+                            .GetSettingRelatedRequest(provider);
+            probe.setFinalizeReq(new io.github.miam1ku.mibandoplusbridge.protocol.huawei.requests
+                    .Request.RequestCallback(provider) {
+                        @Override
+                        public void call(
+                                io.github.miam1ku.mibandoplusbridge.protocol.huawei.requests
+                                        .Request request) {
+                            io.github.miam1ku.mibandoplusbridge.protocol.huawei.requests
+                                    .GetSettingRelatedRequest r =
+                                    (io.github.miam1ku.mibandoplusbridge.protocol.huawei.requests
+                                            .GetSettingRelatedRequest) request;
+                            io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(service,
+                                    "HUAWEI_SETTING_RELATED truSleepNewSync=" + r.truSleepNewSync
+                                            + " rriNewSync=" + r.rriNewSync
+                                            + " gpsNewSync=" + r.gpsNewSync);
+                            enableTruSleepThenDownload.run();
+                        }
+
+                        @Override
+                        public void handleException(
+                                io.github.miam1ku.mibandoplusbridge.protocol.huawei.requests
+                                        .Request request,
+                                io.github.miam1ku.mibandoplusbridge.protocol.huawei.requests
+                                        .Request.ResponseParseException e) {
+                            io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(service,
+                                    "HUAWEI_SETTING_RELATED_FAILED " + e.getMessage());
+                            enableTruSleepThenDownload.run();
+                        }
+                    });
+            try {
+                probe.doPerform();
+            } catch (java.io.IOException e) {
+                io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(service,
+                        "HUAWEI_SETTING_RELATED_FAILED send: " + e.getMessage());
+                enableTruSleepThenDownload.run();
             }
-            // ★ 睡眠本来是握手串行链的最后一段，写库在后台线程里收尾 ——
-            // 没有这一句，后加的表盘阶段（stage 6）永远拿不到执行机会
-            // （2026-10-18 v96 实机：睡眠导完链就停了）。
-            advance.run();
         }, "HuaweiSleepImport").start();
+    }
+
+    /**
+     * 睡眠链（含 0x2C 夜眠下载）收尾：释放 busy 并推进串行链 / 周期 tick。
+     *
+     * <p>busy 在 {@link #maybePullSleep} 里置位、在这里清零，整段 0x2C 文件下载期间
+     * 其它 0x07 拉取都被挡在门外（见周期 tick 的 {@code !sleepPullBusy.get()} 守卫），
+     * 避免 RFCOMM 帧交错。
+     */
+    private void finishSleep(java.util.concurrent.atomic.AtomicBoolean finalized, long epoch,
+            Runnable advance) {
+        sleepPullBusy.set(false);
+        if (finalized.get() || epoch != sessionEpoch) return;
+        advance.run();
     }
 
     /** 人读时间，用于日志排查：2026-10-13 08:44。 */
@@ -1653,6 +1994,9 @@ public final class BandLiveService extends Service {
         // 身份按手表 MAC 持久化：伪 MAC / androidID / secretKey 三者跨会话稳定，
         // 手表才认这台手机；secretKey 由 bind 结束时覆盖写入，重连免确认。
         provider.attachIdentity(new HuaweiIdentityStore(this, address));
+        // 手表是天气同步的主动方：认证通过后挂 0x0F/0x04 常驻监听，
+        // 表上一打开天气 App 就能立刻拿到数据，而不必等手机侧主动推。
+        provider.setWeatherRequestHandler(this::onWatchWeatherRequest);
         provider.setHandshakeListener((success, error) -> {
             if (finalized.get() || epoch != sessionEpoch) {
                 // 上一轮的迟到结果或会话已结束：只放行等待方，不改写结局。
@@ -1702,6 +2046,8 @@ public final class BandLiveService extends Service {
                     // 每段只在上段的终态回调（成功或失败都续走）里发起。
                     // 放在电量之后，保证加密通道已被验证过一次。
                     runSerialStage(provider, finalized, epoch, 0);
+                    // 固件 / 硬件：认证后立刻读一次，独立于上面的串行数据链。
+                    readHuaweiProductInfo(provider);
                 }
             }));
         });
@@ -1754,57 +2100,72 @@ public final class BandLiveService extends Service {
                     // 睡眠链卡死自愈：无声挂死（无终态回调）时强制复位，本轮
                     // 末尾的心率回调之后会自动重试睡眠拉取。
                     clearStuckSleepPull(provider);
-                    provider.readFitnessTotals(new GetFitnessTotalsRequest.TotalsListener() {
-                        @Override
-                        public void onTotals(int steps, int calories, int distance) {
-                            if (finalized.get() || epoch != sessionEpoch) return;
-                            io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(
-                                    BandLiveService.this, "HUAWEI_TOTALS steps=" + steps
-                                            + " calories=" + calories
-                                            + " distance=" + distance);
-                            HuaweiDeviceRegistry.noteSteps(BandLiveService.this, steps);
-                            HuaweiDeviceRegistry.publish(BandLiveService.this);
-                        }
-
-                        @Override
-                        public void onError(String message) {
-                            if (finalized.get() || epoch != sessionEpoch) return;
-                            io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(
-                                    BandLiveService.this, "HUAWEI_TOTALS_FAILED " + message);
-                        }
-                    });
-                    // 心率与步数同频刷新。它走的是同一条 0x0A/0x0B 通道，
-                    // 必须串行 —— 两个同命令的请求同时在飞会互相抢响应。
-                    provider.readHeartRate(new HuaweiSupportProvider.HeartRateListener() {
-                        @Override
-                        public void onHeartRate(int bpm, int measuredAtSec) {
-                            if (finalized.get() || epoch != sessionEpoch) return;
-                            io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(
-                                    BandLiveService.this, "HUAWEI_HR bpm=" + bpm
-                                            + " at=" + measuredAtSec);
-                            if (HuaweiDeviceRegistry.noteHeartRate(BandLiveService.this, bpm)) {
+                    // 0x2C 夜眠下载期间 busy 为 true：此刻跳过 0x07 的汇总/心率拉取，
+                    // 避免两类帧在 RFCOMM 上交错让手表静默丢响应。至多错过一个
+                    // 60 秒周期（0x2C 自带 10s 看门狗），心率心跳不受实质影响。
+                    if (!sleepPullBusy.get()) {
+                        provider.readFitnessTotals(new GetFitnessTotalsRequest.TotalsListener() {
+                            @Override
+                            public void onTotals(int steps, int calories, int distance) {
+                                if (finalized.get() || epoch != sessionEpoch) return;
+                                io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(
+                                        BandLiveService.this, "HUAWEI_TOTALS steps=" + steps
+                                                + " calories=" + calories
+                                                + " distance=" + distance);
+                                HuaweiDeviceRegistry.noteSteps(BandLiveService.this, steps);
                                 HuaweiDeviceRegistry.publish(BandLiveService.this);
+                                try {
+                                    String deviceId = HuaweiDeviceRegistry.deviceId(BandLiveService.this);
+                                    if (deviceId != null && !deviceId.isBlank()) {
+                                        HuaweiStepsImporter.enqueueDayTotal(BandLiveService.this, deviceId,
+                                                steps, calories, distance, java.time.ZoneId.systemDefault());
+                                    }
+                                } catch (Throwable ignored) { }
                             }
-                            // 电量随心率同频刷新：设备页从 band-state 投影读电量，
-                            // 旧版只在握手读一次，长连接下电量整天不动（设备页
-                            // 62% vs 手表 61% 的冻结就是这么来的）。0x01 服务，
-                            // 不占 0x07 通道，可与睡眠拉取并行。
-                            refreshHuaweiBattery(provider, finalized, epoch);
-                            // 心率链已收尾、通道空闲：补一次睡眠拉取（带
-                            // 15 分钟新鲜度门槛与在飞互斥，非每次都真发）。
-                            // 周期路径不走握手阶段机，advance 是空跑。
-                            maybePullSleep(provider, finalized, epoch, NO_ADVANCE);
-                        }
 
-                        @Override
-                        public void onError(String message) {
-                            if (finalized.get() || epoch != sessionEpoch) return;
-                            io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(
-                                    BandLiveService.this, "HUAWEI_HR_FAILED " + message);
-                            refreshHuaweiBattery(provider, finalized, epoch);
-                            maybePullSleep(provider, finalized, epoch, NO_ADVANCE);
-                        }
-                    }, samples -> enqueueHuaweiMinutes(samples, 3600L));
+                            @Override
+                            public void onError(String message) {
+                                if (finalized.get() || epoch != sessionEpoch) return;
+                                io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(
+                                        BandLiveService.this, "HUAWEI_TOTALS_FAILED " + message);
+                            }
+                        });
+                        // 心率与步数同频刷新。它走的是同一条 0x0A/0x0B 通道，
+                        // 必须串行 —— 两个同命令的请求同时在飞会互相抢响应。
+                        provider.readHeartRate(new HuaweiSupportProvider.HeartRateListener() {
+                            @Override
+                            public void onHeartRate(int bpm, int measuredAtSec) {
+                                if (finalized.get() || epoch != sessionEpoch) return;
+                                io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(
+                                        BandLiveService.this, "HUAWEI_HR bpm=" + bpm
+                                                + " at=" + measuredAtSec);
+                                if (HuaweiDeviceRegistry.noteHeartRate(BandLiveService.this, bpm)) {
+                                    HuaweiDeviceRegistry.publish(BandLiveService.this);
+                                }
+                                // 电量随心率同频刷新：设备页从 band-state 投影读电量，
+                                // 旧版只在握手读一次，长连接下电量整天不动（设备页
+                                // 62% vs 手表 61% 的冻结就是这么来的）。0x01 服务，
+                                // 不占 0x07 通道，可与睡眠拉取并行。
+                                refreshHuaweiBattery(provider, finalized, epoch);
+                                // 心率链已收尾、通道空闲：补一次睡眠拉取（带
+                                // 15 分钟新鲜度门槛与在飞互斥，非每次都真发）。
+                                // 周期路径不走握手阶段机，advance 是空跑。
+                                maybePullSleep(provider, finalized, epoch, NO_ADVANCE);
+                            }
+
+                            @Override
+                            public void onError(String message) {
+                                if (finalized.get() || epoch != sessionEpoch) return;
+                                io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(
+                                        BandLiveService.this, "HUAWEI_HR_FAILED " + message);
+                                refreshHuaweiBattery(provider, finalized, epoch);
+                                maybePullSleep(provider, finalized, epoch, NO_ADVANCE);
+                            }
+                        }, samples -> enqueueHuaweiMinutes(samples, 3600L));
+                    } else {
+                        io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(
+                                BandLiveService.this, "HUAWEI_TICK_DEFERRED sleep busy");
+                    }
                 }
             }
         } catch (InterruptedException interrupted) {

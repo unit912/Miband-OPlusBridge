@@ -111,6 +111,41 @@ public final class HuaweiStepsImporter {
         return new Result(steps, heart, oxygen, purged);
     }
 
+    /**
+     * 把 GT3 的当日汇总（0x07/0x03 FitnessTotals）写成 {@code steps_day} 日汇总记录。
+     *
+     * <p>GT3 的分钟明细只回活动时段，真正的日总步数/活动消耗来自这个总计。
+     * 写成 {@code steps_day} 后，OHealthStepWriter 才能把权威日总卡路里写进
+     * 表 1002 与运动缓存，避免首页消耗环/日汇总与手表不同步。</p>
+     *
+     * @return 是否成功入队（相同 fingerprint 会返回 false，不必视为失败）
+     */
+    public static boolean enqueueDayTotal(android.content.Context context, String deviceId,
+            int steps, int calories, int distance, ZoneId zone) {
+        if (steps < 0 && calories < 0 && distance < 0) return true;
+        if (deviceId == null || deviceId.isBlank()) return false;
+        ZoneId resolved = zone == null ? ZoneId.systemDefault() : zone;
+        HealthRecordStore store = new HealthRecordStore(context);
+        try {
+            long startMs = java.time.LocalDate.now(resolved)
+                    .atStartOfDay(resolved)
+                    .toInstant()
+                    .toEpochMilli();
+            long endMs = startMs + 86_400_000L;
+            store.enqueueMeasurement(measurement(deviceId, "steps_day", startMs, steps, resolved,
+                    calories >= 0 ? calories : null,
+                    distance >= 0 ? distance : null, endMs, "continuous"));
+            return true;
+        } catch (IllegalStateException | SecurityException unavailable) {
+            SessionLog.line(context, "HUAWEI_DAYTOTAL_QUEUE_UNAVAILABLE "
+                    + unavailable.getMessage());
+            return false;
+        } catch (RuntimeException refused) {
+            SessionLog.line(context, "HUAWEI_DAYTOTAL_QUEUE_REJECTED " + refused.getMessage());
+            return false;
+        }
+    }
+
     /** manual 模式的瞬时点写入：区间长度 1ms（HealthRecord 的区间约束）。 */
     private static boolean writeManual(android.content.Context context, HealthRecordStore store,
             String deviceId, String kind, long startMs, int value, ZoneId zone) {

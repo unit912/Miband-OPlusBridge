@@ -109,9 +109,6 @@ public final class WeatherActivity extends AppCompatActivity {
             if ("WEATHER_TRANSPORT_CONFIRMED".equals(deliveryCode)) {
                 message += "\n上次确认传输：" + time(delivery.getLong("confirmedAtMs", 0))
                         + "。仍需在手环核对实际显示。";
-            } else if (!deliveryCode.isEmpty() && !"WEATHER_CITIES_READY".equals(deliveryCode)
-                    && !"WEATHER_READING_CITIES".equals(deliveryCode)) {
-                message += "\n" + weatherError(deliveryCode);
             }
             BandWeatherEncoder.Sample captured = valid;
             String result = message;

@@ -111,7 +111,7 @@ public final class MainActivity extends AppCompatActivity {
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
-        screen = BridgeScreen.attach(this, "小米手环", false);
+        screen = BridgeScreen.attach(this, "腕桥", false);
         LinearLayout statusCard = screen.card();
         deviceName = screen.title(statusCard, "正在读取设备状态…");
         connectionLine = screen.bodyText(statusCard, "");
@@ -254,7 +254,7 @@ public final class MainActivity extends AppCompatActivity {
                 Intent send = new Intent(Intent.ACTION_SEND);
                 send.setType("text/plain");
                 send.putExtra(Intent.EXTRA_STREAM, uri);
-                send.putExtra(Intent.EXTRA_SUBJECT, "小米手环桥接调试日志");
+                send.putExtra(Intent.EXTRA_SUBJECT, "腕桥调试日志");
                 send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
                 Intent qq = new Intent(send);
                 qq.setPackage("com.tencent.mobileqq");
@@ -405,7 +405,7 @@ public final class MainActivity extends AppCompatActivity {
                         : HuaweiDeviceRegistry.provisioned(this)
                                 // 华为链路没有小米所有权可接管：设备由桥接直接管理，
                                 // 落回小米文案会让人以为还要去接管小米运动健康。
-                                ? "已由桥接直接管理（华为链路），无需小米运动健康参与。"
+                                ? "已由桥接直接管理（华为链路），无需华为运动健康参与。"
                                 : "NATIVE".equals(owner.mode())
                                         ? "已由桥接管理。连接状态以设备实际响应为准。"
                                         : "当前由小米运动健康管理。可点击连接重新接管。";

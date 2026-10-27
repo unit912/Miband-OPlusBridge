@@ -225,6 +225,10 @@ public class FitnessData {
                 this.serviceId = FitnessData.id;
                 this.commandId = commandId;
 
+                // 0x81 是「由手表在响应里回填 0x02:count」的空容器标签，与 Gadgetbridge
+                // 同款请求对齐。先前误以为空容器会让夜眠缺失而改成带 0x02:0 的容器，
+                // 但夜眠根本不在 0x0C/0x0D 消息通道（走 0x2C 文件通道），该通道无论
+                // 哪种 0x81 写法都只返回小睡，改法属无效误改，现还原。
                 this.tlv = new HuaweiTLV()
                         .put(0x81)
                         .put(0x03, start)

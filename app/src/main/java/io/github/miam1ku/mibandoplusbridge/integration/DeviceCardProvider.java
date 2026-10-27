@@ -177,12 +177,29 @@ public final class DeviceCardProvider extends ContentProvider {
     }
 
     private static String spaceIcon(io.github.miam1ku.mibandoplusbridge.data.LocalPrefs state) {
-        return "android.resource://com.heytap.mydevices/drawable/"
-                + BandCatalog.spaceIcon(state.getString("modelId", ""));
+        // 2026-10-26：旧实现发 android.resource://com.heytap.mydevices/drawable/
+        // default_wristband —— 但 mydevices 里根本不存在 default_watch /
+        // default_wristband 这两个资源（实际只有 icon_default_device / icon_watch），
+        // 加载失败后列表卡退化成蓝色占位块（icon_default_device）、详情页退化成
+        // 白方表（icon_watch）。上游小米卡正是把自己 DeviceImageStore 的 content URI
+        // 填进 iconUrl（注释原话："An empty picture URL makes device space use
+        // icon_default_device"）。
+        //
+        // 2026-10-27：列表卡此前指向 /watchface_preview 已生效，但详情页大图
+        // （BlueToothDetailActivity.mDeviceIconIV）经
+        // transformIconUrl2FileProviderUri 加载时只认 /device_image 路径
+        // （dex 里有 "/device_image/" 字符串，无 miband-body 命名约束）。
+        // 这里与上游 bodyIcon 一致，把 iconUrl/mIconUrl 都指向
+        // /device_image/miband-body-0.png —— provider 的 openFile 对
+        // /device_image 与 /device_image/<name>.png 都 serve 同一张桥接
+        // 合成 PNG，列表卡与详情页同源。健康 App 设备页顶部图仍走
+        // /watchface_preview（OHealthWatchfaceHook.decodePreview）。
+        return "content://" + AUTHORITY + "/device_image/miband-body-0.png";
     }
 
     @Override public String getType(Uri uri) {
         requireReader();
+        if (imagePath(uri)) return "image/png";
         requireUri(uri);
         return "vnd.android.cursor.dir/vnd." + AUTHORITY + ".device_info";
     }
@@ -305,16 +322,24 @@ public final class DeviceCardProvider extends ContentProvider {
     }
 
     /**
-     * 表盘预览 PNG：{@code content://<authority>/watchface_preview}。
+     * 表盘预览 PNG：{@code content://<authority>/watchface_preview} 与
+     * {@code content://<authority>/device_image}（或带文件名
+     * {@code /device_image/<name>.png}）。
      *
-     * <p>宿主进程的 {@code OHealthWatchfaceHook} 换设备页顶部静态图时
-     * 从这里读图。文件缺失（桥接刚装、还没 publish 过）时同步现画一张，
+     * <p>宿主健康 App 的 {@code OHealthWatchfaceHook} 换设备页顶部静态图时
+     * 从 {@code /watchface_preview} 读图；mydevices 设备空间的列表卡与详情页
+     * （{@code BlueToothDetailActivity.mDeviceIconIV}）按 iconUrl 字段经
+     * {@code transformIconUrl2FileProviderUri} 加载大图，要求 URI 走
+     * {@code /device_image} 路径——上游小米卡正是把
+     * {@code content://<authority>/device_image/miband-body-<v>.png} 填进
+     * iconUrl。两条路径都返回同一张桥接合成的 GT3 表盘 PNG，保证列表卡与
+     * 详情页同源。文件缺失（桥接刚装、还没 publish 过）时同步现画一张，
      * 保证首次打开设备页就有图。
      */
     @Override
     public android.os.ParcelFileDescriptor openFile(Uri uri, String mode) {
         requireReader();
-        if (!"watchface_preview".equals(uri.getLastPathSegment())) {
+        if (!imagePath(uri)) {
             throw new IllegalArgumentException("UNSUPPORTED_FILE_URI " + uri);
         }
         if (!"r".equals(mode)) throw new IllegalArgumentException("READ_ONLY");
@@ -330,5 +355,31 @@ public final class DeviceCardProvider extends ContentProvider {
         } catch (java.io.FileNotFoundException e) {
             throw new IllegalStateException("WATCHFACE_PREVIEW_MISSING", e);
         }
+    }
+
+    /**
+     * 判断 URI 是否是本 provider 提供的图片路径。
+     *
+     * <p>支持三种形式：
+     * <ul>
+     *   <li>{@code /watchface_preview} —— 健康设备页顶部静态图；</li>
+     *   <li>{@code /device_image} —— mydevices 列表卡与详情页大图（裸路径）；</li>
+     *   <li>{@code /device_image/<name>.png} —— 上游 {@code bodyIcon} 形态，
+     *       文件名形如 {@code miband-body-<v>.png}，但本 provider 不校验
+     *       文件名，任何 {@code .png} 后缀都接受。</li>
+     * </ul>
+     */
+    private static boolean imagePath(Uri uri) {
+        if (uri == null || !AUTHORITY.equals(uri.getAuthority())) return false;
+        java.util.List<String> segments = uri.getPathSegments();
+        if (segments == null || segments.isEmpty()) return false;
+        String first = segments.get(0);
+        if ("watchface_preview".equals(first)) return true;
+        if (!"device_image".equals(first)) return false;
+        if (segments.size() == 1) return true;
+        // 上游 bodyIcon 用 device_image/miband-body-<v>.png 形式；mydevices
+        // 详情页对文件名无强约束（dex 里只有 /device_image/ 路径片段），
+        // 这里只校验 .png 后缀，足够宽松兼容上游命名与本机直接访问。
+        return segments.size() == 2 && segments.get(1).endsWith(".png");
     }
 }

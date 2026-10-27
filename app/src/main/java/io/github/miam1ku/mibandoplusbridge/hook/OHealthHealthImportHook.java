@@ -62,6 +62,18 @@ public final class OHealthHealthImportHook {
     private String lastFailure;
     /** 图表注入用：TimeStampedData 类/构造器/取值方法（宿主步数柱状图聚合输入）。 */
     private Class<?> chartTsdClass;
+
+    /** 主调栈里第一个宿主业务类名（跳过 lambda/合成方法），探针日志用。 */
+    private static String callerOf(StackTraceElement[] stack) {
+        for (StackTraceElement s : stack) {
+            String c = s.getClassName();
+            if (c.startsWith(HOST) && !c.contains("lambda") && !c.contains("ExternalSynthetic")
+                    && !c.endsWith("SportDataAdapter")) {
+                return c.replace(HOST + ".", "") + "." + s.getMethodName();
+            }
+        }
+        return "?";
+    }
     private Constructor<?> chartTsdCtor;
     private Method chartTsdTs;
     private final Runnable work = this::runScheduled;
@@ -218,6 +230,197 @@ public final class OHealthHealthImportHook {
                     }
                 });
         } catch (Throwable ignored) { }
+        // 2026-10-25: 活动消耗环 9361 vs 消耗卡 98。运动缓存 dump 证实环不读缓存
+        // （缓存 calorie=98.0 与卡一致）。hook 宿主统一数据库读入口，记录首页各环
+        // 的查询参数（表号/时间窗/聚合模式/调用方），定位环的真实数据源与单位。
+        try {
+            Class<?> ringApiClass = Class.forName(
+                    "com.heytap.databaseengine.api.ISportHealthDataAPI", false, host.loader);
+            Class<?> ringReadClass = Class.forName(
+                    "com.heytap.databaseengine.option.DataReadOption", false, host.loader);
+            for (java.lang.reflect.Method m : ringApiClass.getMethods()) {
+                if (!m.getName().equals("readSportHealthData")) continue;
+                XposedBridge.hookMethod(m, new XC_MethodHook() {
+                    @Override protected void beforeHookedMethod(MethodHookParam param) {
+                        try {
+                            Object option = param.args.length > 0 ? param.args[0] : null;
+                            if (option == null) return;
+                            int table = -1;
+                            try {
+                                table = (Integer) ringReadClass.getMethod("getDataTable").invoke(option);
+                            } catch (Throwable ignored) { }
+                            if (table != 1001 && table != 1002 && table != 1003) return;
+                            StringBuilder sb = new StringBuilder("DB_READ table=").append(table);
+                            for (String getter : new String[]{"getStartTime", "getEndTime",
+                                    "getDeviceUniqueId", "getReadHealthDataType",
+                                    "getGroupUnitType", "getReadSportMode", "getCount"}) {
+                                try {
+                                    Object v = ringReadClass.getMethod(getter).invoke(option);
+                                    if (v != null && !v.equals(0) && !v.equals("")) {
+                                        sb.append(' ').append(getter.substring(3)).append('=').append(v);
+                                    }
+                                } catch (Throwable ignored) { }
+                            }
+                            String caller = "?";
+                            for (StackTraceElement s : new Throwable().getStackTrace()) {
+                                String c = s.getClassName();
+                                if (c.startsWith("com.heytap.health") && !c.contains("lambda")
+                                        && !c.contains("ExternalSynthetic")
+                                        && !c.contains("DataRepositoryHelper")) {
+                                    caller = c.replace("com.heytap.health.", "");
+                                    break;
+                                }
+                            }
+                            sb.append(" caller=").append(caller);
+                            HookRuntime.log(sb.toString());
+                            XposedBridge.log("OplusBandBridge " + sb);
+                        } catch (Throwable ignored) { }
+                    }
+                });
+                break;
+            }
+        } catch (Throwable ignored) { }
+        // 2026-10-25: 环 9361 vs 卡 98。首页无 readSportHealthData 调用 → 环不走数据库 API。
+        // hook 运动缓存的全部读写方：谁在写（98.0/2.24 是谁写的）、谁在读（环的调用栈）。
+        try {
+            Class<?> sdaClass = Class.forName(
+                    "com.heytap.health.core.provider.adapter.open.SportDataAdapter", false, host.loader);
+            java.lang.reflect.Method sdaQueryCtx = null;
+            java.lang.reflect.Method sdaQueryToday = null;
+            java.lang.reflect.Method sdaUpdate = null;
+            for (java.lang.reflect.Method m : sdaClass.getMethods()) {
+                if (java.lang.reflect.Modifier.isStatic(m.getModifiers())) {
+                    if (m.getName().equals("querySportData")
+                            && m.getParameterCount() == 1) sdaQueryCtx = m;
+                    if (m.getName().equals("queryTodaySportData")
+                            && m.getParameterCount() == 0) sdaQueryToday = m;
+                    if (m.getName().equals("updateSportData")
+                            && m.getParameterCount() == 2) sdaUpdate = m;
+                }
+            }
+            final java.lang.reflect.Method qCtx = sdaQueryCtx;
+            final java.lang.reflect.Method qToday = sdaQueryToday;
+            if (sdaUpdate != null) {
+                XposedBridge.hookMethod(sdaUpdate, new XC_MethodHook() {
+                    @Override protected void beforeHookedMethod(MethodHookParam param) {
+                        try {
+                            Object values = param.args.length > 1 ? param.args[1] : null;
+                            if (!(values instanceof android.content.ContentValues cv)) return;
+                            StringBuilder sb = new StringBuilder("CACHE_WRITE put=");
+                            for (java.util.Map.Entry<String, Object> e : cv.valueSet()) {
+                                sb.append(e.getKey()).append('=').append(e.getValue()).append(',');
+                            }
+                            sb.append(" caller=").append(callerOf(new Throwable().getStackTrace()));
+                            HookRuntime.log(sb.toString());
+                            XposedBridge.log("OplusBandBridge " + sb);
+                        } catch (Throwable ignored) { }
+                    }
+                });
+            }
+            java.lang.reflect.Method[] readers = {qCtx, qToday};
+            for (final java.lang.reflect.Method reader : readers) {
+                if (reader == null) continue;
+                XposedBridge.hookMethod(reader, new XC_MethodHook() {
+                    @Override protected void afterHookedMethod(MethodHookParam param) {
+                        try {
+                            Object result = param.hasThrowable() ? null : param.getResult();
+                            if (!(result instanceof android.os.Bundle b)) return;
+                            Object shown = b.get("calorie");
+                            int watch = OHealthStepWriter.watchCaloriesToday();
+                            if (watch >= 0) b.putDouble("calorie", (double) watch);
+                            String line = "CACHE_READ step=" + b.get("step")
+                                    + " calorie=" + shown + " -> " + b.get("calorie")
+                                    + " distance=" + b.get("distance")
+                                    + " activityCount=" + b.get("activityCount")
+                                    + " caller=" + callerOf(new Throwable().getStackTrace());
+                            HookRuntime.log(line);
+                            XposedBridge.log("OplusBandBridge " + line);
+                        } catch (Throwable ignored) { }
+                    }
+                });
+            }
+        } catch (Throwable ignored) { }
+        // 2026-10-25: 环 9361 数据源定位。环值 = DailyActivityDayBean.currentCalorie
+        // = SportDataStat.getTotalCalories()/1000（表 1002 聚合，aggregateType=108）。
+        // 探针抓：① getTotalCalories 原始 long（看表 1002 真实存值）② setCurrentCalorie 终值（环显示）。
+        try {
+            Class<?> sdsClass = Class.forName(
+                    "com.heytap.databaseengine.model.SportDataStat", false, host.loader);
+            for (java.lang.reflect.Method m : sdsClass.getMethods()) {
+                if (m.getName().equals("getTotalCalories") && m.getParameterCount() == 0
+                        && m.getReturnType().equals(long.class)) {
+                    XposedBridge.hookMethod(m, new XC_MethodHook() {
+                        @Override protected void afterHookedMethod(MethodHookParam param) {
+                            try {
+                                long v = (Long) param.getResult();
+                                StackTraceElement[] stack = new Throwable().getStackTrace();
+                                String caller = callerOf(stack);
+                                // Only the home activity ring reads through this repository. Other
+                                // consumers (export, share, task cards) keep the real stored value.
+                                boolean ring = false;
+                                for (StackTraceElement s : stack) {
+                                    if (s.getClassName().contains("DailyActivity")) { ring = true; break; }
+                                }
+                                long result = v;
+                                if (ring) {
+                                    int watch = OHealthStepWriter.watchCaloriesToday();
+                                    if (watch >= 0) result = (long) watch * 1000L;
+                                }
+                                String line = "SDS_TOTAL_CALORIES raw=" + v + " /1000=" + (v / 1000)
+                                        + " ring=" + ring + " final=" + result + " caller=" + caller;
+                                HookRuntime.log(line);
+                                XposedBridge.log("OplusBandBridge " + line);
+                                if (result != v) param.setResult(result);
+                            } catch (Throwable ignored) { }
+                        }
+                    });
+                    HookRuntime.log("RING_HOOK sds=ok");
+                    break;
+                }
+            }
+        } catch (Throwable failure) {
+            HookRuntime.log("RING_HOOK sds=fail " + failure);
+        }
+        try {
+            Class<?> beanClass = Class.forName(
+                    "com.heytap.health.daily.bean.DailyActivityDayBean", false, host.loader);
+            for (java.lang.reflect.Method m : beanClass.getMethods()) {
+                if (m.getName().equals("setCurrentCalorie") && m.getParameterCount() == 1
+                        && m.getParameterTypes()[0].equals(int.class)) {
+                    XposedBridge.hookMethod(m, new XC_MethodHook() {
+                        @Override protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                int v = (Integer) param.args[0];
+                                StackTraceElement[] stack = new Throwable().getStackTrace();
+                                // Only the home ring builds this bean. The detail page and the
+                                // export paths build it for arbitrary dates and keep stored values.
+                                boolean ring = false;
+                                for (StackTraceElement s : stack) {
+                                    if (s.getClassName().contains("DailyActivityCardRepository")) {
+                                        ring = true;
+                                        break;
+                                    }
+                                }
+                                int result = v;
+                                if (ring) {
+                                    int watch = OHealthStepWriter.watchCaloriesToday();
+                                    if (watch >= 0) result = watch;
+                                }
+                                String line = "BEAN_SET_CALORIE value=" + v + " ring=" + ring
+                                        + " final=" + result + " caller=" + callerOf(stack);
+                                HookRuntime.log(line);
+                                XposedBridge.log("OplusBandBridge " + line);
+                                if (result != v) param.args[0] = result;
+                            } catch (Throwable ignored) { }
+                        }
+                    });
+                    HookRuntime.log("RING_HOOK bean=ok");
+                    break;
+                }
+            }
+        } catch (Throwable failure) {
+            HookRuntime.log("RING_HOOK bean=fail " + failure);
+        }
         XposedHelpers.findAndHookMethod(Application.class, "onCreate", new XC_MethodHook() {
             @Override protected void afterHookedMethod(MethodHookParam param) {
                 restoreSystemAccount();

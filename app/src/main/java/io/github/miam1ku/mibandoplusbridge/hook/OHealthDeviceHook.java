@@ -128,6 +128,110 @@ public final class OHealthDeviceHook {
         installNativePanel(loader);
         installEmptyCloudCleanup(loader);
         observeSnapshots(loader);
+        hookWatchProviderIcon(loader);
+    }
+
+    /** 桥接渲染图的 content URI（桥接 provider 的白名单本来就放行 mydevices 读取）。 */
+    private static final String BRIDGE_DEVICE_IMAGE_URI =
+            "content://io.github.miam1ku.mibandoplusbridge.devices/device_image";
+
+    /**
+     * 2026-10-26：yield=true 时健康卡顶上（正确的单卡状态），但健康卡 device_data 的
+     * 面型是展示模型 W301CN，mydevices 按 modelId 映射出「白色金属链带」的内置默认
+     * 渲染图——列表卡显示的手表和 GT3 毫无关系。这里 hook 健康 WatchProvider 的
+     * query 出口，把这台表的行的 device_data 里 iconUrl/mIconUrl 改写成桥接渲染图。
+     *
+     * <p>必须重建 MatrixCursor 而不是包 CursorWrapper：跨进程 cursor 走
+     * CursorWindow 原生填充，Java 层 getString 改写不影响传输内容；
+     * MatrixCursor 的行数据会被逐行拷进窗口，改写值能真正到达 mydevices。
+     * 无命中行时原样返回，零额外开销。
+     */
+    private static void hookWatchProviderIcon(ClassLoader loader) {
+        try {
+            Class<?> provider = XposedHelpers.findClass(
+                    "com.heytap.health.linkage.watch.WatchProvider", loader);
+            // query 可能在任意一层父类声明（WatchProvider 本体实测没有覆写）——
+            // 沿继承链收集全部声明；基类入口被别的 provider 复用时，
+            // rewriteHealthCardIcon 里的 device_data+MAC 命中条件保证只动本表行。
+            java.util.LinkedHashSet<java.lang.reflect.Method> found = new java.util.LinkedHashSet<>();
+            for (Class<?> k = provider; k != null && k != Object.class; k = k.getSuperclass()) {
+                for (java.lang.reflect.Method m : k.getDeclaredMethods()) {
+                    if (!"query".equals(m.getName())) continue;
+                    if (!android.database.Cursor.class.isAssignableFrom(m.getReturnType())) continue;
+                    if (java.lang.reflect.Modifier.isAbstract(m.getModifiers())) continue;
+                    found.add(m);
+                }
+            }
+            for (java.lang.reflect.Method m : found) {
+                XposedBridge.hookMethod(m, new XC_MethodHook() {
+                    @Override protected void afterHookedMethod(MethodHookParam param) {
+                        rewriteHealthCardIcon(param);
+                    }
+                });
+            }
+            HookRuntime.log("DEVICE_SPACE_ICON_HOOK_INSTALLED methods=" + found.size());
+        } catch (Throwable failure) {
+            HookRuntime.log("DEVICE_SPACE_ICON_HOOK_UNAVAILABLE "
+                    + failure.getClass().getSimpleName());
+        }
+    }
+
+    /** 命中本表行时重建 cursor 并改写 iconUrl/mIconUrl；否则原样返回。 */
+    private static void rewriteHealthCardIcon(XC_MethodHook.MethodHookParam param) {
+        // 只处理卡片表查询（基类入口会被其它 provider 复用）
+        if (param.args == null || param.args.length == 0
+                || !(param.args[0] instanceof android.net.Uri uri)
+                || !String.valueOf(uri).contains("device_info")) return;
+        if (!(param.getResult() instanceof android.database.Cursor cursor)) return;
+        try {
+            int dataIdx = cursor.getColumnIndex("device_data");
+            int idIdx = cursor.getColumnIndex("device_id");
+            if (dataIdx < 0 || cursor.getCount() == 0) return;
+            Bundle shown = snapshot;
+            String mac = shown == null ? "" : shown.getString("mac", "");
+            if (mac == null || mac.isBlank()) return;
+            String md5 = md5Lowercase(mac.toLowerCase(java.util.Locale.ROOT));
+            int hit = -1;
+            for (int pos = 0; cursor.moveToPosition(pos); pos++) {
+                String data = cursor.getString(dataIdx);
+                if (data == null || !data.contains("iconUrl")) continue;
+                boolean match = (idIdx >= 0 && md5.equals(cursor.getString(idIdx)))
+                        || data.contains(mac);
+                if (match) { hit = pos; break; }
+            }
+            if (hit < 0) return;
+            String[] cols = cursor.getColumnNames();
+            android.database.MatrixCursor out =
+                    new android.database.MatrixCursor(cols, cursor.getCount());
+            android.net.Uri notify = cursor.getNotificationUri();
+            for (int pos = 0; cursor.moveToPosition(pos); pos++) {
+                Object[] row = new Object[cols.length];
+                for (int i = 0; i < cols.length; i++) {
+                    if (i == dataIdx && cursor.getPosition() == hit) {
+                        org.json.JSONObject o = new org.json.JSONObject(cursor.getString(i));
+                        o.put("iconUrl", BRIDGE_DEVICE_IMAGE_URI);
+                        o.put("mIconUrl", BRIDGE_DEVICE_IMAGE_URI);
+                        row[i] = o.toString();
+                        continue;
+                    }
+                    row[i] = switch (cursor.getType(i)) {
+                        case android.database.Cursor.FIELD_TYPE_NULL -> null;
+                        case android.database.Cursor.FIELD_TYPE_INTEGER -> cursor.getLong(i);
+                        case android.database.Cursor.FIELD_TYPE_BLOB -> cursor.getBlob(i);
+                        default -> cursor.getString(i);
+                    };
+                }
+                out.addRow(row);
+            }
+            if (notify != null && hostContext != null) {
+                out.setNotificationUri(hostContext.getContentResolver(), notify);
+            }
+            param.setResult(out);
+            HookRuntime.log("DEVICE_SPACE_HEALTH_ICON swapped row=" + hit);
+        } catch (Throwable failure) {
+            HookRuntime.log("DEVICE_SPACE_ICON_REWRITE_FAILED "
+                    + failure.getClass().getSimpleName());
+        }
     }
 
     /**

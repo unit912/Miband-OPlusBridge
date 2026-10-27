@@ -15,6 +15,7 @@ import io.github.miam1ku.mibandoplusbridge.protocol.huawei.packets.FitnessData;
 import io.github.miam1ku.mibandoplusbridge.protocol.huawei.packets.Notifications;
 import io.github.miam1ku.mibandoplusbridge.protocol.huawei.requests.GetAuthRequest;
 import io.github.miam1ku.mibandoplusbridge.protocol.huawei.requests.HuaweiDataSyncListener;
+import io.github.miam1ku.mibandoplusbridge.protocol.huawei.requests.HuaweiWeatherListener;
 import io.github.miam1ku.mibandoplusbridge.protocol.huawei.requests.GetBondParamsRequest;
 import io.github.miam1ku.mibandoplusbridge.protocol.huawei.requests.GetBondRequest;
 import io.github.miam1ku.mibandoplusbridge.protocol.huawei.requests.GetDeviceStatusRequest;
@@ -69,6 +70,10 @@ public final class HuaweiSupportProvider implements HuaweiSocketCallback {
     /** 数据同步（0x37）的常驻监听器。认证通过后挂上，断链时摘掉。 */
     private final java.util.List<Request> dataSyncListeners =
             java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+
+    /** 天气（0x0F/0x04）的常驻监听器与它的业务处理者。 */
+    private HuaweiWeatherListener weatherListener;
+    private HuaweiWeatherListener.Handler weatherHandler;
 
     private final HuaweiPacket.ParamsProvider paramsProvider = new DefaultParamsProvider();
     private Context context;
@@ -980,6 +985,7 @@ public final class HuaweiSupportProvider implements HuaweiSocketCallback {
                 // 没有能力位就不知道设备支不支持 config/event/data，挂上去只会
                 // 收到一堆解不开或无法归类的帧。
                 registerDataSyncListeners();
+                registerWeatherListener();
                 notifyHandshakeResult(true, null);
             }
 
@@ -1032,6 +1038,45 @@ public final class HuaweiSupportProvider implements HuaweiSocketCallback {
                 inProgressRequests.remove(listener);
             }
             dataSyncListeners.clear();
+        }
+        unregisterWeatherListener();
+    }
+
+    /**
+     * 挂上天气（0x0F/0x04）的常驻监听。
+     *
+     * <p>华为手表是天气同步的主动方：它发 {@code WeatherDeviceRequest} 要天气，
+     * 手机必须回应。之前桥接没有任何常驻 handler 认领它，手表干等到超时后显示
+     * 「天气暂不可用」。见 {@link HuaweiWeatherListener} 的类注释。
+     *
+     * <p>监听帧是加密的，因此和 {@link #registerDataSyncListeners()} 一样只能在
+     * 认证通过（加密参数就绪）之后挂。
+     */
+    private void registerWeatherListener() {
+        if (weatherListener != null || weatherHandler == null) return;
+        HuaweiWeatherListener listener = new HuaweiWeatherListener(this, weatherHandler);
+        weatherListener = listener;
+        addInProgressRequest(listener);
+        LOG.info("weather listener registered");
+    }
+
+    private void unregisterWeatherListener() {
+        HuaweiWeatherListener listener = weatherListener;
+        if (listener == null) return;
+        weatherListener = null;
+        responseManager.removeHandler(listener);
+        inProgressRequests.remove(listener);
+    }
+
+    /**
+     * 设置「手表要天气」时的处理者。可在认证前调用：认证完成后自动挂载监听。
+     *
+     * <p>回调运行在 socket 读线程上，实现方必须自行切到业务线程再做推送。
+     */
+    public void setWeatherRequestHandler(HuaweiWeatherListener.Handler handler) {
+        this.weatherHandler = handler;
+        if (authenticated) {
+            registerWeatherListener();
         }
     }
 
