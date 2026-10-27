@@ -49,6 +49,7 @@ import java.time.Instant;
 import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -62,6 +63,8 @@ public final class MainActivity extends AppCompatActivity {
     private LinearLayout setupCard;
     private LinearLayout healthAccessCard;
     private String selectedAddress = "";
+    private boolean miMode;
+    private boolean pendingHuaweiPair;
     private TextView status;
     private TextView ownershipStatus;
     private Button open;
@@ -91,7 +94,7 @@ public final class MainActivity extends AppCompatActivity {
     private boolean rootGranted;
     private boolean probingRoot;
     private Change pendingPermission;
-    private static final String SETUP_PREREQ = "开始前：系统蓝牙配对；LSPosed 启用本模块并勾选小米运动健康、OHealth、我的设备后强停一次；在 KernelSU 中允许本应用。";
+    private static final String SETUP_PREREQ = "开始前：在系统蓝牙里配对好华为手表；LSPosed 启用本模块并勾选 OHealth、我的设备后强停一次；在 KernelSU 中允许本应用。";
     enum Change { ADD, RECONNECT, REMOVE, RESTORE }
 
     /** Open the profile window when this restore task succeeded and the user came in from the capture entry. */
@@ -111,6 +114,10 @@ public final class MainActivity extends AppCompatActivity {
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
+        // 是否暴露小米手环导入流程：仅当“未配对华为表”且“确实装了小米运动健康”时才显示。
+        // 我们的交付分支以华为表为主，避免在主界面残留小米运动健康字样。
+        miMode = !HuaweiDeviceRegistry.provisioned(this)
+                && HostIdentity.installed(this, HostIdentity.MI_PACKAGE);
         screen = BridgeScreen.attach(this, "腕桥", false);
         LinearLayout statusCard = screen.card();
         deviceName = screen.title(statusCard, "正在读取设备状态…");
@@ -138,12 +145,12 @@ public final class MainActivity extends AppCompatActivity {
         homePrimary = screen.filled("检查 Root", this::runHomePrimary);
         openKsu = screen.outlined("打开 KernelSU", this::openKernelSu);
         remove = screen.outlined("从健康移除", () -> new MaterialAlertDialogBuilder(this)
-                .setTitle("从健康移除手环？")
-                .setMessage("将停止桥接连接并恢复小米运动健康。已保存的健康历史和加密绑定信息会保留；以后可重新添加同一只手环。")
+                .setTitle("移除华为手表？")
+                .setMessage("将停止桥接连接并移除这块华为手表。已保存的健康历史和加密绑定信息会保留；以后可重新配对同一只手表。")
                 .setNegativeButton("取消", null)
                 .setPositiveButton("移除", (dialog, which) -> changeOwnership(Change.REMOVE))
                 .show());
-        restore = screen.textButton("重试恢复小米运动健康", () -> changeOwnership(Change.RESTORE));
+        restore = screen.textButton("重试恢复官方应用", () -> changeOwnership(Change.RESTORE));
         restore.setVisibility(View.GONE);
         screen.heading("常用");
         LinearLayout shortcuts = screen.card();
@@ -166,7 +173,7 @@ public final class MainActivity extends AppCompatActivity {
         LinearLayout.LayoutParams sleepParams = new LinearLayout.LayoutParams(-1, -2);
         sleepParams.bottomMargin = BridgeScreen.dp(this, 8);
         sleepCard.addView(sleepPause, sleepParams);
-        screen.caption(sleepCard, "手环报入睡后暂停正在播放的音乐，醒来不自动继续。刚打开时如果已经在睡，不会马上暂停。这只手环若不回报实时入睡，就等睡眠记录同步后再暂停，大约几分钟。");
+        screen.caption(sleepCard, "手表报入睡后暂停正在播放的音乐，醒来不自动继续。刚打开时如果已经在睡，不会马上暂停。这块手表若不回报实时入睡，就等睡眠记录同步后再暂停，大约几分钟。");
         screen.setLastChildMargin(sleepCard, 0);
         final boolean[] writingSleepPause = {false};
         sleepPause.setChecked(SleepMusic.enabled(this));
@@ -190,41 +197,51 @@ public final class MainActivity extends AppCompatActivity {
         screen.textButton("高级设置", () -> {
             boolean openNow = advanced.getVisibility() != View.VISIBLE;
             advanced.setVisibility(openNow ? View.VISIBLE : View.GONE);
-            if (openNow) refreshBonded();
+            if (openNow && miMode) refreshBonded();
         });
         LinearLayout.LayoutParams advancedParams = new LinearLayout.LayoutParams(-1, -2);
         screen.body.addView(advanced, advancedParams);
-        screen.heading(advanced, "绑定导入与诊断");
-        screen.caption(advanced, "导入和协议采集前，先恢复官方管理，再在小米运动健康中操作。设备登记和健康历史会保留。");
-        advancedRestore = screen.outlined(advanced, "恢复官方管理", () -> changeOwnership(Change.RESTORE));
-        screen.caption(advanced, "选择已配对设备");
-        bonded = new LinearLayout(this);
-        bonded.setOrientation(LinearLayout.VERTICAL);
-        advanced.addView(bonded);
-        String preselected = getIntent().getStringExtra("deviceAddress");
-        if (preselected != null && preselected.matches("[0-9A-F]{2}(:[0-9A-F]{2}){5}")) {
-            selectedAddress = preselected;
+        screen.heading(advanced, "华为配对与诊断");
+        screen.caption(advanced, "先在系统蓝牙里配对好华为手表，再点「配对华为手表」选择它。配对后由桥接服务自动维持连接，无需手动导入绑定。");
+
+        // 华为配对入口：列出系统已配对设备，点一下直接配对，免去 adb 与查 MAC。
+        screen.outlined(advanced, "配对华为手表", this::startHuaweiPairingPicker);
+
+        if (miMode) {
+            screen.caption(advanced, "小米手环导入（仅安装小米运动健康时可用）：恢复官方管理后，在小米运动健康里操作。设备登记和健康历史会保留。");
+            advancedRestore = screen.outlined(advanced, "恢复官方管理", () -> changeOwnership(Change.RESTORE));
+            screen.caption(advanced, "选择已配对设备");
+            bonded = new LinearLayout(this);
+            bonded.setOrientation(LinearLayout.VERTICAL);
+            advanced.addView(bonded);
+            String preselected = getIntent().getStringExtra("deviceAddress");
+            if (preselected != null && preselected.matches("[0-9A-F]{2}(:[0-9A-F]{2}){5}")) {
+                selectedAddress = preselected;
+            }
+            open = screen.outlined(advanced, "开启一次性导入（120 秒）", () -> {
+                if (!hostSupported) return;
+                if (selectedAddress.isBlank()) {
+                    status.setText("请先选择一只已配对设备。");
+                    return;
+                }
+                Bundle selected = new Bundle();
+                selected.putString("address", selectedAddress);
+                action("openWindow", selected);
+            });
+            open.setEnabled(false);
+            screen.outlined(advanced, "关闭所有导入／采集窗口", () -> action("closeWindow", null));
+            screen.outlined(advanced, "打开小米运动健康", () -> {
+                Intent launch = getPackageManager().getLaunchIntentForPackage(HostIdentity.MI_PACKAGE);
+                if (launch == null) {
+                    status.setText("无法打开小米运动健康。请检查应用是否已安装且启用。");
+                    return;
+                }
+                startActivity(launch);
+            });
+        } else {
+            advancedRestore = null;
+            open = null;
         }
-        open = screen.outlined(advanced, "开启一次性导入（120 秒）", () -> {
-            if (!hostSupported) return;
-            if (selectedAddress.isBlank()) {
-                status.setText("请先选择一只已配对设备。");
-                return;
-            }
-            Bundle selected = new Bundle();
-            selected.putString("address", selectedAddress);
-            action("openWindow", selected);
-        });
-        open.setEnabled(false);
-        screen.outlined(advanced, "关闭所有导入／采集窗口", () -> action("closeWindow", null));
-        screen.outlined(advanced, "打开小米运动健康", () -> {
-            Intent launch = getPackageManager().getLaunchIntentForPackage(HostIdentity.MI_PACKAGE);
-            if (launch == null) {
-                status.setText("无法打开小米运动健康。请检查应用是否已安装且启用。");
-                return;
-            }
-            startActivity(launch);
-        });
         if (BuildConfig.DEBUG) {
             screen.outlined(advanced, "采集连接参数（120 秒）", () -> action("openDiagnostics", null));
             screen.outlined(advanced, "采集协议消息（120 秒）", () -> new MaterialAlertDialogBuilder(this)
@@ -236,8 +253,10 @@ public final class MainActivity extends AppCompatActivity {
             screen.outlined(advanced, "独立连接诊断", () -> startActivity(new Intent(this, DiagnosticActivity.class)));
             screen.outlined(advanced, "协议测试", () -> startActivity(new Intent(this, LabActivity.class)));
         }
-        status = screen.bodyText(advanced, "正在检查小米运动健康是否可用…");
-        screen.caption(advanced, "只读取所选设备的绑定信息。信息在本机加密保存，不上传、不写入设备卡片。蓝牙名称不能证明型号。");
+        status = screen.bodyText(advanced, miMode ? "正在检查小米运动健康是否可用…" : "华为配对与诊断工具。");
+        screen.caption(advanced, miMode
+                ? "只读取所选设备的绑定信息。信息在本机加密保存，不上传、不写入设备卡片。蓝牙名称不能证明型号。"
+                : "列出的是系统已配对设备。点「配对华为手表」后会打开设备列表，选择你的手表即可。蓝牙名称不能证明型号，请确认选的是华为手表。");
         getContentResolver().registerContentObserver(CredentialProvider.URI, false, observer);
         getContentResolver().registerContentObserver(DeviceCardProvider.URI, false, deviceObserver);
         getContentResolver().registerContentObserver(HealthQueueProvider.URI, false, deviceObserver);
@@ -309,17 +328,26 @@ public final class MainActivity extends AppCompatActivity {
         refreshOwnership();
         refreshDevice();
         refreshBonded();
-        if (hostSupported) refresh();
-        else worker.execute(() -> {
-            boolean supported = HostIdentity.installed(this, HostIdentity.MI_PACKAGE);
-            main.post(() -> {
-                if (isDestroyed()) return;
-                hostSupported = supported;
-                open.setEnabled(supported && rootGranted);
-                if (supported) refresh();
-                else status.setText("已安装的小米运动健康版本不受支持。导入已禁用。");
+        if (HuaweiDeviceRegistry.provisioned(this)) {
+            // 华为链路不依赖小米运动健康：直接视为可用，避免误报「不支持」。
+            hostSupported = true;
+            if (open != null) open.setEnabled(false);
+            refresh();
+        } else if (miMode) {
+            worker.execute(() -> {
+                boolean supported = HostIdentity.installed(this, HostIdentity.MI_PACKAGE);
+                main.post(() -> {
+                    if (isDestroyed()) return;
+                    hostSupported = supported;
+                    if (open != null) open.setEnabled(supported && rootGranted);
+                    if (supported) refresh();
+                    else status.setText("已安装的小米运动健康版本不受支持。导入已禁用。");
+                });
             });
-        });
+        } else {
+            hostSupported = false;
+            if (open != null) open.setEnabled(false);
+        }
         ensureCallPermissions();
     }
 
@@ -572,6 +600,12 @@ public final class MainActivity extends AppCompatActivity {
             return;
         }
         if (requestCode != BLUETOOTH_PERMISSION) return;
+        if (pendingHuaweiPair) {
+            pendingHuaweiPair = false;
+            if (hasBluetoothPermission()) showHuaweiDevicePicker();
+            else ownershipStatus.setText("配对华为手表需要附近设备权限。请在权限设置中授权后重试。");
+            return;
+        }
         Change requested = pendingPermission;
         pendingPermission = null;
         refreshDevice();
@@ -627,9 +661,9 @@ public final class MainActivity extends AppCompatActivity {
         remove.setVisibility(registered && rootGranted ? View.VISIBLE : View.GONE);
         remove.setEnabled(!changingOwnership);
         restore.setVisibility(rootGranted && needsOfficialRestore() ? View.VISIBLE : View.GONE);
-        restore.setText(registered ? "恢复小米运动健康" : "重试恢复小米运动健康");
+        restore.setText(registered ? "恢复官方应用" : "重试恢复官方应用");
         restore.setEnabled(!changingOwnership);
-        advancedRestore.setEnabled(!changingOwnership && rootGranted);
+        if (advancedRestore != null) advancedRestore.setEnabled(!changingOwnership && rootGranted);
     }
 
     private SetupProgress readProgress() {
@@ -662,9 +696,15 @@ public final class MainActivity extends AppCompatActivity {
     }
     private void bindChecklist(SetupProgress progress) {
         bindChecklistRow(checklistRoot, progress, SetupProgress.Step.ROOT, "KernelSU 授权");
-        bindChecklistRow(checklistImport, progress, SetupProgress.Step.IMPORT, "导入绑定");
-        bindChecklistRow(checklistProfile, progress, SetupProgress.Step.PROFILE, "采集连接参数");
-        bindChecklistRow(checklistAdd, progress, SetupProgress.Step.ADD, "添加到健康");
+        if (progress.huawei) {
+            bindChecklistRow(checklistImport, progress, SetupProgress.Step.IMPORT, "配对华为手表");
+            bindChecklistRow(checklistProfile, progress, SetupProgress.Step.PROFILE, "配对华为手表");
+            bindChecklistRow(checklistAdd, progress, SetupProgress.Step.ADD, "配对华为手表");
+        } else {
+            bindChecklistRow(checklistImport, progress, SetupProgress.Step.IMPORT, "导入绑定");
+            bindChecklistRow(checklistProfile, progress, SetupProgress.Step.PROFILE, "采集连接参数");
+            bindChecklistRow(checklistAdd, progress, SetupProgress.Step.ADD, "添加到健康");
+        }
         String hint = progress.primaryHint();
         primaryHint.setText(hint);
         primaryHint.setVisibility(hint.isEmpty() ? View.GONE : View.VISIBLE);
@@ -696,9 +736,10 @@ public final class MainActivity extends AppCompatActivity {
             requestRoot();
             return;
         }
-        // 华为设备没有小米所有权可接管：主按钮直接进重新配对入口。
+        // 华为设备没有小米所有权可接管：未配对走设备选择器，已配对走重新配对。
         if (progress.huawei) {
-            startHuaweiPairing();
+            if (HuaweiDeviceRegistry.provisioned(this)) startHuaweiPairing();
+            else startHuaweiPairingPicker();
             return;
         }
         switch (progress.current()) {
@@ -726,6 +767,99 @@ public final class MainActivity extends AppCompatActivity {
         intent.putExtra("model", HuaweiDeviceRegistry.model(this));
         intent.putExtra("autostart", true);
         startActivity(intent);
+    }
+
+    /**
+     * 配对华为手表：列出系统已配对设备，点一下直接配对。
+     * 取代原来只能 adb 拉起 + 手查 MAC 的入口；MAC 与型号都从系统蓝牙直接取。
+     */
+    private void startHuaweiPairingPicker() {
+        if (changingOwnership || probingRoot) return;
+        if (!rootGranted) {
+            requestRoot();
+            return;
+        }
+        if (!isUnlocked()) {
+            ownershipStatus.setText("请先解锁手机，再配对华为手表。");
+            return;
+        }
+        if (!hasBluetoothPermission()) {
+            pendingHuaweiPair = true;
+            requestPermissions(new String[]{Manifest.permission.BLUETOOTH_CONNECT}, BLUETOOTH_PERMISSION);
+            return;
+        }
+        showHuaweiDevicePicker();
+    }
+
+    private void showHuaweiDevicePicker() {
+        BluetoothAdapter adapter = getSystemService(BluetoothManager.class).getAdapter();
+        if (adapter == null) {
+            ownershipStatus.setText("此设备没有蓝牙适配器。");
+            return;
+        }
+        java.util.Set<BluetoothDevice> devices;
+        try {
+            devices = adapter.getBondedDevices();
+        } catch (SecurityException denied) {
+            ownershipStatus.setText("需要附近设备权限才能列出已配对设备。");
+            return;
+        }
+        if (devices == null || devices.isEmpty()) {
+            new MaterialAlertDialogBuilder(this)
+                    .setTitle("请先在系统蓝牙中配对华为手表")
+                    .setMessage("打开系统蓝牙设置，把华为手表配对到这台手机后，再来这里选择它。")
+                    .setPositiveButton("知道了", null)
+                    .show();
+            return;
+        }
+        java.util.List<BluetoothDevice> listed = new ArrayList<>(devices);
+        listed.sort(Comparator.comparing((BluetoothDevice device) -> !looksLikeHuaweiWatch(device.getName()))
+                .thenComparing(device -> safeName(device.getName()), String.CASE_INSENSITIVE_ORDER));
+        String[] names = new String[listed.size()];
+        String[] macs = new String[listed.size()];
+        for (int index = 0; index < listed.size(); index++) {
+            BluetoothDevice device = listed.get(index);
+            macs[index] = device.getAddress() == null ? "" : device.getAddress().toUpperCase(Locale.ROOT);
+            String label = safeName(device.getName());
+            if (!macs[index].isBlank()) label += "  (" + macs[index] + ")";
+            names[index] = label;
+        }
+        new MaterialAlertDialogBuilder(this)
+                .setTitle("选择要配对的华为手表")
+                .setItems(names, (dialog, which) -> pairHuaweiDevice(macs[which]))
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
+    private void pairHuaweiDevice(String mac) {
+        if (mac == null || mac.isBlank()) return;
+        if (!BluetoothAdapter.checkBluetoothAddress(mac)) {
+            ownershipStatus.setText("蓝牙地址无效：" + mac);
+            return;
+        }
+        Intent intent = new Intent();
+        intent.setComponent(new ComponentName(this, HuaweiPairActivity.class));
+        intent.putExtra("mac", mac);
+        intent.putExtra("model", "");
+        intent.putExtra("autostart", true);
+        startActivity(intent);
+        ownershipStatus.setText("已拉起配对，请在手表上确认配对请求；成功后由桥接自动连接。");
+    }
+
+    private static boolean looksLikeHuaweiWatch(String name) {
+        if (name == null) return false;
+        String normalized = name.toUpperCase(Locale.ROOT);
+        return normalized.contains("HUAWEI") || normalized.contains("WATCH")
+                || normalized.contains("MATE") || normalized.contains("BUDS")
+                || normalized.contains("GT ") || normalized.contains("GT2")
+                || normalized.contains("GT3") || normalized.contains("GT4")
+                || normalized.contains("GT5") || normalized.contains("ULTIMATE");
+    }
+
+    private static String safeName(String name) {
+        if (name == null) return "未命名设备";
+        String clean = name.replaceAll("[\\p{Cntrl}\\p{Cf}]", "").trim();
+        return clean.isEmpty() ? "未命名设备" : clean;
     }
 
     private void refreshDevice() {
@@ -847,21 +981,21 @@ public final class MainActivity extends AppCompatActivity {
             case "USER_LOCKED" -> "请先解锁手机。";
             case "UNPROVISIONED", "BINDING_INCOMPLETE" -> "绑定信息不完整或不可用，请在高级设置中重新导入。";
             case "BINDING_ADDRESS" -> "绑定里的蓝牙地址不是大写 MAC。请重新选择这只手环再导入。";
-            case "BINDING_REGION" -> "绑定里没有地区。请打开小米运动健康里的这只手环，等它连上后再导入一次。";
+            case "BINDING_REGION" -> "绑定里没有地区。请在原厂 App 里打开这只手环，等它连上后再导入一次。";
             case "TOKEN_ENCODING_UNSUPPORTED" -> "绑定里的密钥不是 16 字节。请让手环在小米运动健康里连上一次后再导入。";
-            case "OBSERVED_PROFILE_REQUIRED" -> "连接参数丢失。请点「采集连接参数」，在小米运动健康中重连一次手环。";
+            case "OBSERVED_PROFILE_REQUIRED" -> "连接参数丢失。请在原厂 App 里重连一次手表，或重新配对。";
             case "FIRMWARE_OR_MODEL_UNSUPPORTED" -> "手环未返回可用的型号或固件。";
             case "OOB_BRANCH_UNSUPPORTED" -> "这只设备使用了不受支持的配对认证。";
             case "PROTOCOL_VERSION_UNSUPPORTED", "SESSION_CONFIGURATION_UNSUPPORTED" -> "官方连接不是可接管的 SPP 会话。蓝牙或 GATT-only 设备无法添加。";
             case "DEVICE_IDENTITY_CHANGED" -> "导入设备与已保存的设备身份不一致，不能替换。请重新导入原手环。";
             case "BAND_STATE_STORAGE_FAILED", "OWNERSHIP_STORAGE_FAILED" -> "设备状态未能保存，请检查可用存储空间后重试。";
             case "ROOT_REQUIRED", "ROOT_ACTION_FAILED", "ROOT_ACTION_TIMEOUT" -> "请确认已授予桥接应用 KernelSU root 权限后重试。";
-            case "HOST_VERSION_UNSUPPORTED" -> "小米运动健康版本不受支持，请更换受支持的版本后重试。";
+            case "HOST_VERSION_UNSUPPORTED" -> "原厂 App 版本不受支持，请更换受支持的版本后重试。";
             case "NEARBY_PERMISSION_REQUIRED" -> "请授予附近设备权限后重试。";
             case "DEVICE_NOT_REGISTERED" -> "请先添加设备。";
             case "DIAGNOSTIC_SOCKET_STILL_ACTIVE" -> "连接尚未完全停止，请稍后重试恢复官方管理。";
             case "OWNERSHIP_RECOVERY_REQUIRED", "OFFICIAL_ALREADY_DISABLED" -> "请先恢复官方管理并确认官方应用已启用，再重试接管。";
-            case "OWNERSHIP_ROLLBACK_FAILED" -> "接管回滚没有完成，小米运动健康可能仍是停用。请再试一次恢复官方管理。";
+            case "OWNERSHIP_ROLLBACK_FAILED" -> "接管回滚没有完成，原厂 App 可能仍是停用。请再试一次恢复官方管理。";
             default -> "操作未完成，请重试；必要时先恢复官方管理。";
         };
     }
@@ -896,7 +1030,7 @@ public final class MainActivity extends AppCompatActivity {
         }
         String code = response.getString("status", "CREDENTIAL_STORAGE_FAILED");
         String text = switch (code) {
-            case "IMPORT_WINDOW_OPEN" -> "导入窗口已开启。请在小米运动健康中打开所选设备，让官方应用重新读取绑定信息。";
+            case "IMPORT_WINDOW_OPEN" -> "导入窗口已开启。请在原厂 App 中打开所选设备，让官方应用重新读取绑定信息。";
             case "IMPORT_WINDOW_CLOSED" -> "所有导入和协议采集窗口均已关闭。";
             case "DIAGNOSTIC_WINDOW_OPEN" -> "连接参数采集已开启。仅观察已导入手环的连接类型和协议版本，不记录消息内容或密钥。请在官方应用中重连。";
             case "PROTOCOL_CAPTURE_OPEN" -> "协议消息采集已开启，120 秒后关闭。请执行本次测试操作。";
@@ -928,7 +1062,7 @@ public final class MainActivity extends AppCompatActivity {
                 if (hostSupported) {
                     Intent launch = getPackageManager().getLaunchIntentForPackage(HostIdentity.MI_PACKAGE);
                     if (launch == null) {
-                        ownershipStatus.setText("无法打开小米运动健康。请检查应用是否已安装且启用。");
+                        ownershipStatus.setText("无法打开原厂 App。请检查应用是否已安装且启用。");
                     } else {
                         startActivity(launch);
                     }
@@ -974,14 +1108,20 @@ public final class MainActivity extends AppCompatActivity {
         }
     }
     private void showSetupGuide() {
+        boolean paired = HuaweiDeviceRegistry.provisioned(this);
+        String guide = paired
+                ? "你已配对华为手表，连接由桥接服务自动维持。\n\n"
+                    + "如需重新配对或换表：进入「高级设置 → 配对华为手表」，从列表里选择系统已配对的手表，并在表上确认配对请求即可。\n\n"
+                    + SETUP_PREREQ
+                : "1. 打开 KernelSU，为本应用打开超级用户权限，返回后点「检查 Root」。\n"
+                    + "2. 在系统蓝牙里配对好华为手表（手表需处于可配对/可被发现状态）。\n"
+                    + "3. 进入「高级设置 → 配对华为手表」，从列表里选择你的华为手表。\n"
+                    + "4. 手表会弹出配对确认，在表上点一下确认；配对成功后由桥接自动连接。\n"
+                    + "5. 下拉快捷面板或控制中心添加「手环」磁贴，点一下即可拉起连接，不会断开。\n\n"
+                    + SETUP_PREREQ;
         new MaterialAlertDialogBuilder(this)
                 .setTitle("使用说明")
-                .setMessage("1. 打开 KernelSU，为本应用打开超级用户权限，返回后点「检查 Root」。\n"
-                        + "2. 导入绑定：选择已配对手环，打开小米运动健康点开该设备。连接参数会同时记录。\n"
-                        + "3. 若提示连接参数丢失：点「采集连接参数」，在小米运动健康里再连一次手环。\n"
-                        + "4. 添加到健康：暂停小米运动健康并由本应用接管。\n"
-                        + "控制中心编辑里添加「手环」。下拉或点一下会拉起连接，不会断开。\n\n"
-                        + SETUP_PREREQ)
+                .setMessage(guide)
                 .setPositiveButton("关闭", null)
                 .show();
     }

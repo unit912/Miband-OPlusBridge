@@ -48,7 +48,7 @@ public final class SetupProgress {
             case ROOT -> "检查 Root";
             case IMPORT -> "导入绑定";
             case PROFILE -> "采集连接参数";
-            case ADD -> "添加到健康";
+            case ADD -> huawei ? "配对华为手表" : "添加到健康";
             // 华为链路没有「接管小米运动健康」可做：主按钮是重新配对入口。
             case DONE -> huawei ? "重新配对" : "立即同步";
         };
@@ -57,10 +57,10 @@ public final class SetupProgress {
     public String primaryHint() {
         return switch (current()) {
             case ROOT -> "打开 KernelSU，为本应用打开超级用户权限，返回后点「检查 Root」。";
-            case IMPORT -> "选择已配对手环，打开小米运动健康点开该设备。120 秒内同时导入绑定并记录连接参数。";
-            case PROFILE -> "打开小米运动健康并点开这只手环，让它重新连上。120 秒内记录 SPP 连接参数。";
+            case IMPORT -> "选择已配对设备，打开原厂 App 点开该设备。120 秒内同时导入绑定并记录连接参数。";
+            case PROFILE -> "打开原厂 App 并点开这只手环，让它重新连上。120 秒内记录 SPP 连接参数。";
             case ADD -> huawei
-                    ? "正在把手表写入 OPPO 健康与设备空间，自动完成，无需导入小米绑定。"
+                    ? "由桥接自动写入 OPPO 健康与设备空间，无需手动导入绑定。"
                     : "将暂停小米运动健康并由本应用接管。手环不必在线。";
             case DONE -> "";
         };
