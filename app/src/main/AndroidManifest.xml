@@ -32,7 +32,7 @@
             <category android:name="android.intent.category.LAUNCHER" />
         </intent>
     </queries>
-    <application android:name=".BridgeApplication" android:label="腕桥"
+    <application android:name=".BridgeApplication" android:label="H₂O"
         android:description="@string/xposed_description" android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher"

@@ -1,4 +1,4 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="xposed_description">腕桥：把华为手表接入 ColorOS 设备空间和 OPPO 健康。</string>
+    <string name="xposed_description">H₂O：把华为手表接入 ColorOS 设备空间和 OPPO 健康。</string>
 </resources>

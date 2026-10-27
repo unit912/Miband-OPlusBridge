@@ -108,7 +108,7 @@ public final class MainActivity extends AppCompatActivity {
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
-        screen = BridgeScreen.attach(this, "腕桥", false);
+        screen = BridgeScreen.attach(this, "H₂O", false);
         LinearLayout statusCard = screen.card();
         deviceName = screen.title(statusCard, "正在读取设备状态…");
         connectionLine = screen.bodyText(statusCard, "");
@@ -223,7 +223,7 @@ public final class MainActivity extends AppCompatActivity {
                 Intent send = new Intent(Intent.ACTION_SEND);
                 send.setType("text/plain");
                 send.putExtra(Intent.EXTRA_STREAM, uri);
-                send.putExtra(Intent.EXTRA_SUBJECT, "腕桥调试日志");
+                send.putExtra(Intent.EXTRA_SUBJECT, "H₂O调试日志");
                 send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
                 Intent qq = new Intent(send);
                 qq.setPackage("com.tencent.mobileqq");
