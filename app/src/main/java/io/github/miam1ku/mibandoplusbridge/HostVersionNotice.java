@@ -10,8 +10,7 @@ public final class HostVersionNotice {
 
     public static final List<Expectation> EXPECTATIONS = List.of(
             new Expectation("OPPO 健康", HostIdentity.HEALTH_PACKAGE, "6.1.18、6.9.37 或 6.9.40"),
-            new Expectation("设备空间", HostIdentity.DEVICES_PACKAGE, "17.4.10 或 17.25"),
-            new Expectation("小米运动健康", HostIdentity.MI_PACKAGE, "3.59.1"));
+            new Expectation("设备空间", HostIdentity.DEVICES_PACKAGE, "17.4.10 或 17.25"));
 
     public record Installed(String packageName, String versionName, long versionCode, boolean present) {}
 
