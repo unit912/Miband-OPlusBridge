@@ -774,18 +774,19 @@ public final class BandLiveService extends Service {
     /**
      * 按包名挑手表上的通知类型（图标/样式不同），未知一律 generic。
      *
-     * <p>GT3 固件对微信(0x03)/QQ(0x0B) 这类 IM 专属类型会去匹配手表端对应 App，
-     * 数据不符就静默丢弃不显示；实测微信走 0x03 时手表收包 ACK 但屏上不出现。
-     * 改为统一走 generic(0x7F) —— 与 H₂O「手表已连接」通知同款渲染路径，GT3 稳定显示。
+     * <p>微信(0x03)/QQ(0x0B) 是 IM 专属类型，GT3 固件会用它们渲染对应 App 的彩色图标
+     * （已实测：v188 起微信/QQ 均正常显示彩色企鹅/微信图标）。务必保留这两个类型，
+     * 改成 generic(0x7F) 会丢失彩色图标且让通知看起来不像对应 App。
      * 邮件(0x0F)/短信(0x02) 是标准类型，GT3 原生支持，保留。
      */
     private static byte huaweiNotificationType(String pkg) {
         if (pkg == null) return Notifications.NotificationType.generic;
         switch (pkg) {
             case "com.tencent.mm":
+                return Notifications.NotificationType.weChat;
             case "com.tencent.mobileqq":
             case "com.tencent.tim":
-                return Notifications.NotificationType.generic;
+                return Notifications.NotificationType.qq;
             case "com.android.mms":
             case "com.google.android.apps.messaging":
             case "com.samsung.android.messaging":
