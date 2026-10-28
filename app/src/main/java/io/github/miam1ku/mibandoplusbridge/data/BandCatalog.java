@@ -115,12 +115,14 @@ public final class BandCatalog {
 
     /** Device-space card type. Bands use the system wristband glyph, watches use the watch glyph. */
     public static String spaceType(String model) {
-        return watchForm(model) ? "WATCH" : "WRISTBAND";
+        // 任何华为 BR/EDR 手表都按手表卡片显示（Fit / GT / Ultimate 等），
+        // 不依赖型号表是否收录；没收录的型号走下方 watchForm 判定。
+        return watchForm(model) || huaweiModel(model) ? "WATCH" : "WRISTBAND";
     }
 
     /** Drawable name in {@code com.heytap.mydevices}. Empty iconUrl falls back to a phone. */
     public static String spaceIcon(String model) {
-        return watchForm(model) ? "default_watch" : "default_wristband";
+        return watchForm(model) || huaweiModel(model) ? "default_watch" : "default_wristband";
     }
 
     public static boolean watchForm(String model) {

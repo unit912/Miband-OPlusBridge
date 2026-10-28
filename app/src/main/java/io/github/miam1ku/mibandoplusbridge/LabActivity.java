@@ -150,8 +150,10 @@ public final class LabActivity extends AppCompatActivity {
         int battery = state.getInt("battery", -1);
         info.setText(deviceText(state, registered, connected, battery));
         session.setText(ready
-                ? "会话就绪，可以发通知、来电和音乐。"
-                : (connected ? "已连接，会话尚未就绪。点立即同步。" : "未连接。点立即同步后再测。"));
+                ? "华为会话已认证 ✓ 可以发通知、来电、音乐、免打扰、闹钟。"
+                : (registered
+                    ? "华为会话未连上。点上面的「立即同步」连上手表（约几秒）后再测。"
+                    : "未登记手表。请先在首页配对华为手表。"));
     }
 
     private static String deviceText(LocalPrefs state, boolean registered, boolean connected, int battery) {
@@ -319,9 +321,14 @@ public final class LabActivity extends AppCompatActivity {
     /** 经华为会话发送一条已构造好的报文；会话未就绪或构造失败都给可见反馈。 */
     private void sendHuawei(String label, io.github.miam1ku.mibandoplusbridge.protocol.huawei.core.HuaweiPacket packet) {
         if (BandLiveService.huaweiParamsProvider() == null) {
-            String msg = label + "：华为会话未就绪。请先点「立即同步」，等手表连上后再试。";
+            // 会话没起来：先把桥接服务拉起来去连手表，下次点按钮就生效。
+            // 这些命令（音乐/免打扰/闹钟）只在手表 RFCOMM 会话在线时才发得出去，
+            // 与「查找手机」不同——查找手机走 OPPO 健康自身、不依赖华为会话。
+            try { BandLiveService.start(this); } catch (RuntimeException ignored) { }
+            String msg = label + "：华为会话还没连上。已尝试连接手表，稍等几秒再点一次。";
             setResultText(msg);
             toast(msg);
+            refresh();
             return;
         }
         if (packet == null) {

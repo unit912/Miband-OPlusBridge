@@ -711,21 +711,28 @@ public final class MainActivity extends AppCompatActivity {
                 .thenComparing(device -> safeName(device.getName()), String.CASE_INSENSITIVE_ORDER));
         String[] names = new String[listed.size()];
         String[] macs = new String[listed.size()];
+        String[] labels = new String[listed.size()];
         for (int index = 0; index < listed.size(); index++) {
             BluetoothDevice device = listed.get(index);
             macs[index] = device.getAddress() == null ? "" : device.getAddress().toUpperCase(Locale.ROOT);
             String label = safeName(device.getName());
+            labels[index] = stripVariant(label);
             if (!macs[index].isBlank()) label += "  (" + macs[index] + ")";
             names[index] = label;
         }
         new MaterialAlertDialogBuilder(this)
                 .setTitle("选择要配对的华为手表")
-                .setItems(names, (dialog, which) -> pairHuaweiDevice(macs[which]))
+                .setItems(names, (dialog, which) -> pairHuaweiDevice(macs[which], labels[which]))
                 .setNegativeButton("取消", null)
                 .show();
     }
 
-    private void pairHuaweiDevice(String mac) {
+    /**
+     * 配对时把系统蓝牙里读到的设备名作为型号带进去（原作者的做法：用手表自己的
+     * 蓝牙广播名当型号，而不是写死 GT3）。Fit5 / GT4 / GT5 等都会显示成真实型号。
+     * 型号只用于展示与设备空间卡片归类，填不对也只会显示原样名字，不会变砖。
+     */
+    private void pairHuaweiDevice(String mac, String name) {
         if (mac == null || mac.isBlank()) return;
         if (!BluetoothAdapter.checkBluetoothAddress(mac)) {
             ownershipStatus.setText("蓝牙地址无效：" + mac);
@@ -734,7 +741,7 @@ public final class MainActivity extends AppCompatActivity {
         Intent intent = new Intent();
         intent.setComponent(new ComponentName(this, HuaweiPairActivity.class));
         intent.putExtra("mac", mac);
-        intent.putExtra("model", "");
+        intent.putExtra("model", name == null ? "" : name);
         intent.putExtra("autostart", true);
         startActivity(intent);
         ownershipStatus.setText("已拉起配对，请在手表上确认配对请求；成功后由桥接自动连接。");
@@ -745,9 +752,17 @@ public final class MainActivity extends AppCompatActivity {
         String normalized = name.toUpperCase(Locale.ROOT);
         return normalized.contains("HUAWEI") || normalized.contains("WATCH")
                 || normalized.contains("MATE") || normalized.contains("BUDS")
+                || normalized.contains("FIT") || normalized.contains("HONOR")
+                || normalized.contains("MAGIC") || normalized.contains("ULTIMATE")
                 || normalized.contains("GT ") || normalized.contains("GT2")
                 || normalized.contains("GT3") || normalized.contains("GT4")
-                || normalized.contains("GT5") || normalized.contains("ULTIMATE");
+                || normalized.contains("GT5");
+    }
+
+    /** 去掉型号尾部的变体后缀（如 GT 3-13D 里的 -13D），避免把颜色/版本段带进型号。 */
+    private static String stripVariant(String name) {
+        if (name == null) return "";
+        return name.replaceAll("[\\s\\-_]+[A-Z0-9]{2,5}$", "").trim();
     }
 
     private static String safeName(String name) {
