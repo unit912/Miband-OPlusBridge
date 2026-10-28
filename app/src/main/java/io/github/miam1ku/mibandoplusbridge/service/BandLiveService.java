@@ -499,9 +499,9 @@ public final class BandLiveService extends Service {
                 }
                 if (suppressForDnd(command,
                         io.github.miam1ku.mibandoplusbridge.notify.PhoneDnd.currentFilter(context))) {
-                    android.util.Log.i("OplusBandBridge", "NOTIFY_SUPPRESSED_DND");
-                    io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(context, "NOTIFY_SUPPRESSED_DND");
-                    return java.util.concurrent.CompletableFuture.completedFuture(null);
+                    // 手表是独立 wearable：消息直达 GT3，不再受手机免打扰抑制。
+                    android.util.Log.i("OplusBandBridge", "NOTIFY_DND_BYPASSED");
+                    io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(context, "NOTIFY_DND_BYPASSED");
                 }
                 live.sendHuaweiNotification(huawei, command);
                 return java.util.concurrent.CompletableFuture.completedFuture(null);
@@ -559,9 +559,9 @@ public final class BandLiveService extends Service {
                 if (ordinaryPost(command) && io.github.miam1ku.mibandoplusbridge.notify.PhoneDnd
                         .blocksNotifications(io.github.miam1ku.mibandoplusbridge.notify.PhoneDnd
                                 .currentFilter(context))) {
-                    android.util.Log.i("OplusBandBridge", "NOTIFY_SUPPRESSED_DND");
-                    io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(context, "NOTIFY_SUPPRESSED_DND");
-                    return java.util.concurrent.CompletableFuture.completedFuture(null);
+                    // 手表是独立 wearable：消息直达 GT3，不再受手机免打扰抑制。
+                    android.util.Log.i("OplusBandBridge", "NOTIFY_DND_BYPASSED");
+                    io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(context, "NOTIFY_DND_BYPASSED");
                 }
                 live.sendHuaweiNotification(huawei, command);
                 return java.util.concurrent.CompletableFuture.completedFuture(null);
@@ -666,9 +666,9 @@ public final class BandLiveService extends Service {
                 if (ordinaryPost(command) && io.github.miam1ku.mibandoplusbridge.notify.PhoneDnd
                         .blocksNotifications(io.github.miam1ku.mibandoplusbridge.notify.PhoneDnd
                                 .currentFilter(this))) {
-                    io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this, "NOTIFY_SUPPRESSED_DND");
-                    held.succeed();
-                    return;
+                    // 手表是独立 wearable：握手期挂起的通知重放也绕过手机免打扰。
+                    android.util.Log.i("OplusBandBridge", "NOTIFY_DND_BYPASSED");
+                    io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this, "NOTIFY_DND_BYPASSED");
                 }
                 sendHuaweiNotification(huawei, command);
                 held.succeed();
@@ -812,6 +812,28 @@ public final class BandLiveService extends Service {
         } catch (java.io.IOException e) {
             return java.util.concurrent.CompletableFuture.failedFuture(e);
         }
+    }
+
+    /**
+     * 协议测试专用：把一条通知/来电 command 直接转华为 Notifications 协议发到手表，
+     * 绕过手机 DND 抑制（forwardHostNotification 在 ordinaryPost 命中 DND 时会丢弃，
+     * 导致「发送测试通知」在开免打扰的手机上明明连着手表却毫无反应）。
+     * 会话未就绪或非通知命令则失败。
+     */
+    public static java.util.concurrent.CompletionStage<Void> sendHuaweiTestNotification(Context context,
+            nodomain.freeyourgadget.gadgetbridge.proto.xiaomi.XiaomiProto.Command command) {
+        if (!notificationCommand(command)) {
+            return java.util.concurrent.CompletableFuture.failedFuture(
+                    new IllegalStateException("NOTIFICATION_SESSION_UNAVAILABLE"));
+        }
+        BandLiveService live = instance;
+        HuaweiSupportProvider huawei = live == null ? null : live.huaweiProvider;
+        if (huawei == null || !huawei.isAuthenticated()) {
+            return java.util.concurrent.CompletableFuture.failedFuture(
+                    new IllegalStateException("NOTIFICATION_SESSION_UNAVAILABLE"));
+        }
+        live.sendHuaweiNotification(huawei, command);
+        return java.util.concurrent.CompletableFuture.completedFuture(null);
     }
 
     /** 当前华为会话的 ParamsProvider；未连接或会话未认证返回 null。 */

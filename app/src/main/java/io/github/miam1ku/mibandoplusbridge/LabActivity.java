@@ -192,7 +192,8 @@ public final class LabActivity extends AppCompatActivity {
         setResultText("正在发送" + label + "…");
         var pending = sessionCommand
                 ? BandLiveService.sendSessionCommand(command)
-                : BandLiveService.forwardHostNotification(this, command);
+                : io.github.miam1ku.mibandoplusbridge.service.BandLiveService
+                        .sendHuaweiTestNotification(this, command);
         pending.whenComplete((ignored, error) -> main.post(() -> finishSend(label, error)));
     }
 
