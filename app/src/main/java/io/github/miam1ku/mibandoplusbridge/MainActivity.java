@@ -61,6 +61,7 @@ public final class MainActivity extends AppCompatActivity {
     private LinearLayout advanced;
     private LinearLayout setupCard;
     private LinearLayout healthAccessCard;
+    private LinearLayout accountCard;
     private boolean pendingHuaweiPair;
     private TextView status;
     private TextView ownershipStatus;
@@ -123,6 +124,13 @@ public final class MainActivity extends AppCompatActivity {
         screen.outlined(healthAccessCard, "打开健康的通知使用权", this::openHealthListenerSettings);
         screen.setLastChildMargin(healthAccessCard, 0);
         healthAccessCard.setVisibility(View.GONE);
+        accountCard = screen.card();
+        TextView accountHint = screen.bodyText(accountCard,
+                "OPPO 健康还没完成账号确认，健康数据暂时写不进去。请打开 OPPO 健康、登录 OPPO/欢太账号，并让它在前台正常运行一次。");
+        accountHint.setTextColor(0xFFB3261E);
+        screen.outlined(accountCard, "打开 OPPO 健康", this::openOHealth);
+        screen.setLastChildMargin(accountCard, 0);
+        accountCard.setVisibility(View.GONE);
         setupCard = screen.card();
         screen.overline(setupCard, "首次设置");
         checklistRoot = screen.caption(setupCard, "");
@@ -225,12 +233,26 @@ public final class MainActivity extends AppCompatActivity {
                 send.putExtra(Intent.EXTRA_STREAM, uri);
                 send.putExtra(Intent.EXTRA_SUBJECT, "H₂O调试日志");
                 send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                // 部分 ROM / Android 16 的分享目标只认 ClipData，且 chooser 包装后 grant
+                // 旗标不一定往下传。双保险：带 ClipData，并显式给所有候选接收方授予读权限，
+                // 避免「弹出了分享框但对方读不到文件」。
+                send.setClipData(android.content.ClipData.newUri(getContentResolver(),
+                        "H₂O调试日志", uri));
+                java.util.List<android.content.pm.ResolveInfo> targets =
+                        getPackageManager().queryIntentActivities(send,
+                                android.content.pm.PackageManager.MATCH_DEFAULT_ONLY);
+                for (android.content.pm.ResolveInfo target : targets) {
+                    grantUriPermission(target.activityInfo.packageName, uri,
+                            Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                }
                 Intent qq = new Intent(send);
                 qq.setPackage("com.tencent.mobileqq");
+                Intent chooser = Intent.createChooser(send, "发送调试日志");
+                chooser.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
                 main.post(() -> {
                     if (isDestroyed()) return;
                     if (qq.resolveActivity(getPackageManager()) != null) startActivity(qq);
-                    else startActivity(Intent.createChooser(send, "发送调试日志"));
+                    else startActivity(chooser);
                 });
             } catch (Exception failure) {
                 main.post(() -> {
@@ -244,6 +266,7 @@ public final class MainActivity extends AppCompatActivity {
     @Override protected void onResume() {
         super.onResume();
         refreshHealthAccessCard();
+        refreshHealthAccountCard();
         promptHostVersions();
         if (!rootGranted) requestRoot();
         else continueInit();
@@ -257,6 +280,46 @@ public final class MainActivity extends AppCompatActivity {
                 && !prefs.getBoolean("healthApproved", true)
                 && prefs.getBoolean("healthGrantFailed", false);
         healthAccessCard.setVisibility(show ? View.VISIBLE : View.GONE);
+    }
+
+    /**
+     * 健康账号确认状态提示。
+     *
+     * <p>写健康数据前要求 binding 表里有一条已确认账号 —— 这条记录只能由宿主 OPPO 健康
+     * 回调 HealthQueueProvider.adoptAccount 写入。宿主从来没被打开初始化过、或者宿主自身
+     * 崩溃时记录就会缺失。以前这种情况会让后台归档线程抛异常并杀掉整个桥接进程，用户只能
+     * 看到「手表要求重新配对」这类表象；这里改成显式告诉用户该做什么。
+     */
+    private void refreshHealthAccountCard() {
+        if (accountCard == null) return;
+        worker.execute(() -> {
+            String state;
+            try {
+                state = new io.github.miam1ku.mibandoplusbridge.data.HealthRecordStore(this)
+                        .accountState();
+            } catch (RuntimeException | Error unavailable) {
+                android.util.Log.w("OplusBandBridge", "ACCOUNT_STATE_UNAVAILABLE", unavailable);
+                return;
+            }
+            main.post(() -> {
+                if (isDestroyed()) return;
+                boolean ready = "ACCOUNT_CONFIRMED".equals(state);
+                accountCard.setVisibility(ready ? View.GONE : View.VISIBLE);
+            });
+        });
+    }
+
+    private void openOHealth() {
+        Intent launch = getPackageManager().getLaunchIntentForPackage("com.heytap.health");
+        if (launch != null) {
+            try {
+                startActivity(launch);
+                return;
+            } catch (RuntimeException ignored) {
+                // 宿主被冻结/停用时打不开，落到下面的提示
+            }
+        }
+        if (ownershipStatus != null) ownershipStatus.setText("打不开 OPPO 健康，可能已被冻结或停用。");
     }
 
     private void openHealthListenerSettings() {

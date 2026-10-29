@@ -559,7 +559,11 @@ public final class HealthRecordStore extends SQLiteOpenHelper {
     public synchronized int purgeWindow(String deviceId, String kind, long startMs, long endMs) {
         if (deviceId == null || deviceId.isBlank() || kind == null || kind.isBlank()) return 0;
         SQLiteDatabase db = getWritableDatabase();
-        String account = requireConfirmedAccount(db);
+        // 宿主还没回调 adoptAccount（健康账号未确认）时，这里原本抛 IllegalStateException，
+        // 经后台归档线程冒泡后会杀掉整个桥接进程。降级：没有已确认账号 => 没有属于它的记录，
+        // 视作无需清理。
+        String account = confirmedAccountHash(db);
+        if (account == null) return 0;
         List<String> ids = new ArrayList<>();
         try (Cursor rows = db.rawQuery("SELECT record_id FROM measurements WHERE account_hash=? "
                 + "AND device_id=? AND kind=? AND start_ms<? AND end_ms>?",

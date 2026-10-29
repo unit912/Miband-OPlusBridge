@@ -1619,10 +1619,25 @@ public final class BandLiveService extends Service {
                 .FitnessData.MessageData.StepResponse.SubContainer> copy =
                 new java.util.ArrayList<>(samples);
         new Thread(() -> {
-            io.github.miam1ku.mibandoplusbridge.data.HuaweiStepsImporter.enqueue(
-                    BandLiveService.this,
-                    HuaweiDeviceRegistry.deviceId(BandLiveService.this), copy,
-                    java.time.ZoneId.systemDefault(), from, now);
+            try {
+                io.github.miam1ku.mibandoplusbridge.data.HuaweiStepsImporter.enqueue(
+                        BandLiveService.this,
+                        HuaweiDeviceRegistry.deviceId(BandLiveService.this), copy,
+                        java.time.ZoneId.systemDefault(), from, now);
+            } catch (RuntimeException | Error unprepared) {
+                // 宿主健康账号还没确认（binding 表为空）时 enqueue 会抛
+                // IllegalStateException(ACCOUNT_CONFIRMATION_REQUIRED)。这一步绝不能让异常
+                // 冒泡：Thread 上的未捕获异常会走 Android 默认 handler 杀掉整个桥接进程，
+                // 表现为 GT3 反复断连并提示重新配对、 UI 操作（分享日志等）半途失灵。
+                // 这里降级为「本轮不入队」，进程继续活着，蓝牙会话不受影响。
+                android.util.Log.w("OplusBandBridge", "MINUTE_ARCHIVE_SKIPPED", unprepared);
+                try {
+                    io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(BandLiveService.this,
+                            "MINUTE_ARCHIVE_SKIPPED " + unprepared);
+                } catch (RuntimeException ignored) {
+                    // 记日志失败不影响主流程
+                }
+            }
         }, "HuaweiMinuteArchive").start();
     }
 
