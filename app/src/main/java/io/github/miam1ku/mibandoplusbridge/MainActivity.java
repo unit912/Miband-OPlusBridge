@@ -153,6 +153,8 @@ public final class MainActivity extends AppCompatActivity {
         screen.heading("常用");
         LinearLayout shortcuts = screen.card();
         screen.outlined(shortcuts, "配对华为手表", this::startHuaweiPairingPicker);
+        screen.navRow(shortcuts, "表盘机身切换", () -> startActivity(new Intent(this,
+                WatchfaceBodyActivity.class)));
         screen.navRow(shortcuts, "设备详情", () -> startActivity(new Intent(this,
                 io.github.miam1ku.mibandoplusbridge.integration.BandDetailsActivity.class)));
         screen.navRow(shortcuts, "协议测试", () -> startActivity(new Intent(this, LabActivity.class)));

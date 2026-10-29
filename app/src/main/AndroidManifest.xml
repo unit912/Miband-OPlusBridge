@@ -53,6 +53,7 @@
             android:theme="@style/Theme.OplusBand.Tile" />
         <activity android:name=".DiagnosticActivity" android:exported="false" />
         <activity android:name=".LabActivity" android:exported="false" />
+        <activity android:name=".WatchfaceBodyActivity" android:exported="false" />
 
         <!-- 华为 GT3 配对入口：adb 驱动（am start 指定本组件，附带 mac 与
              autostart 两个 extra），无 LAUNCHER 入口，不进桌面。 -->

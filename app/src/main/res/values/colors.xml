@@ -11,5 +11,5 @@
     <color name="on_primary_container">#083D39</color>
     <color name="card">#FFFFFF</color>
     <!-- 图标底色，取自用户设计稿的绿（#00A361），四角由它补满 -->
-    <color name="ic_launcher_background">#00A361</color>
+    <color name="ic_launcher_background">#1DA462</color>
 </resources>

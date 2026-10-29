@@ -13,8 +13,6 @@ import android.widget.Toast;
 import androidx.appcompat.app.AppCompatActivity;
 import io.github.miam1ku.mibandoplusbridge.data.BandStateRepository;
 import io.github.miam1ku.mibandoplusbridge.data.LocalPrefs;
-import io.github.miam1ku.mibandoplusbridge.data.WatchfaceBodies;
-import io.github.miam1ku.mibandoplusbridge.data.WatchfacePreviewRenderer;
 import io.github.miam1ku.mibandoplusbridge.protocol.BandNotificationCommand;
 import io.github.miam1ku.mibandoplusbridge.notify.FindPhone;
 import io.github.miam1ku.mibandoplusbridge.notify.PhoneDnd;
@@ -42,8 +40,6 @@ public final class LabActivity extends AppCompatActivity {
     private TextView info;
     private TextView session;
     private TextView result;
-    private final java.util.List<com.google.android.material.button.MaterialButton> bodyButtons =
-            new java.util.ArrayList<>();
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
@@ -112,21 +108,6 @@ public final class LabActivity extends AppCompatActivity {
         screen.filled("测试闹钟响铃", this::sendTestAlarmRing);
         screen.outlined("测试关闭闹钟", this::sendTestAlarmClose);
         screen.outlined("测试稍后响", this::sendTestAlarmSnooze);
-
-        LinearLayout bodyCard = screen.card();
-        screen.overline(bodyCard, "表盘机身");
-        screen.caption(bodyCard, "设备空间和健康里那块表的外壳。点选后约半分钟内自动重画，设备页下次刷新即换。");
-        screen.setLastChildMargin(bodyCard, 0);
-        android.widget.LinearLayout bodyGrid = new android.widget.LinearLayout(this);
-        bodyGrid.setOrientation(android.widget.LinearLayout.VERTICAL);
-        bodyCard.addView(bodyGrid);
-        for (int i = 0; i < WatchfaceBodies.count(); i++) {
-            final String key = WatchfaceBodies.key(i);
-            com.google.android.material.button.MaterialButton b =
-                    screen.outlined(bodyGrid, "", () -> pickBody(key));
-            bodyButtons.add(b);
-        }
-        refreshBodyButtons();
 
         LinearLayout extra = screen.card();
         screen.overline(extra, "其他");
@@ -237,46 +218,6 @@ public final class LabActivity extends AppCompatActivity {
         setResultText(msg);
         toast(msg);
         refresh();
-    }
-
-    private void refreshBodyButtons() {
-        String current = WatchfaceBodies.selectedKey(this);
-        for (int i = 0; i < WatchfaceBodies.count(); i++) {
-            String key = WatchfaceBodies.key(i);
-            String label = key.equals(current)
-                    ? "✓ " + WatchfaceBodies.name(i)
-                    : WatchfaceBodies.name(i);
-            bodyButtonFor(i).setText(label);
-        }
-    }
-
-    private com.google.android.material.button.MaterialButton bodyButtonFor(int index) {
-        return bodyButtons.get(index);
-    }
-
-    private void pickBody(String key) {
-        if (!WatchfaceBodies.select(this, key)) {
-            setResultText("机身切换失败：未知选项。");
-            return;
-        }
-        refreshBodyButtons();
-        setResultText("已选「" + WatchfaceBodies.nameOf(key) + "」，正在重画表盘…");
-        worker.execute(() -> {
-            String message;
-            try {
-                WatchfacePreviewRenderer.render(this);
-                getContentResolver().notifyChange(
-                        io.github.miam1ku.mibandoplusbridge.integration.DeviceCardProvider.URI, null);
-                message = "已切换为「" + WatchfaceBodies.nameOf(key) + "」。设备空间/健康页刷新后生效。";
-            } catch (RuntimeException failure) {
-                message = "重画失败：" + failure.getClass().getSimpleName();
-            }
-            String text = message;
-            main.post(() -> {
-                if (isDestroyed()) return;
-                setResultText(text);
-            });
-        });
     }
 
     private void checkUpdate() {
