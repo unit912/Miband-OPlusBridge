@@ -46,6 +46,12 @@ public final class OHealthHealthImportHook {
     private static final long FAILURE_COOLDOWN_MS = 60_000;
     private static OHealthHealthImportHook installed;
     private final Context context;
+    /**
+     * The app context for hooks installed in the static {@code HostContract}, which has no outer
+     * instance and therefore cannot read {@code this.context}. Needed by the read-layer calorie
+     * patch, which runs inside that nested class.
+     */
+    private static volatile Context appContext;
     private final HostContract host;
     private final OHealthSleepWriter sleep;
     private final OHealthStepWriter steps;
@@ -82,6 +88,7 @@ public final class OHealthHealthImportHook {
             OHealthStepWriter steps, OHealthSportWriter sports) {
         Context application = context.getApplicationContext();
         this.context = application == null ? context : application;
+        appContext = this.context;
         this.host = host;
         this.sleep = sleep;
         this.steps = steps;
@@ -1566,12 +1573,113 @@ public final class OHealthHealthImportHook {
                                                 + " mode=" + mode + " group=" + group
                                                 + " acct=" + acct + " start=" + start
                                                 + " end=" + end + " parse=" + parse + " thr=" + thr);
+                                        // 2026-10-30: 首页独立"消耗"卡片进入的 ConsumptionHistoryActivity
+                                        // 显示 3083 —— 它直接 readSportHealthData 读表 1002，既不走 sport
+                                        // 缓存，也不调 SportDataStat 的任何 getter（calor 探针零命中），
+                                        // 所以读层覆盖只能在这里收口：今日那行的卡路里换成手表值，
+                                        // 历史日原样返回。桥接自己的导入线程(OplusBandRead)不参与，
+                                        // 避免污染我们自己 writeStat 的"先读表实际值"决策。
+                                        if (tbl == OHealthStepWriter.TABLE_STAT && !thr.contains("OplusBandRead")) {
+                                            try {
+                                                // readSportHealthData 返回的是 RxJava Observable，
+                                                // 数据要等订阅后才经观察者回调——这里拿不到 bean，
+                                                // 必须挂 doOnNext 在真正发射时再改。
+                                                Object observable = p.hasThrowable() ? null : p.getResult();
+                                                if (observable != null) {
+                                                    Class<?> consumerClass = Class.forName(
+                                                            "io.reactivex.rxjava3.functions.Consumer", false, loader);
+                                                    java.lang.reflect.Method doOnNext = null;
+                                                    for (java.lang.reflect.Method dm : observable.getClass().getMethods()) {
+                                                        if (dm.getName().equals("doOnNext") && dm.getParameterCount() == 1
+                                                                && dm.getParameterTypes()[0].isAssignableFrom(consumerClass)) {
+                                                            doOnNext = dm;
+                                                            break;
+                                                        }
+                                                    }
+                                                    if (doOnNext != null) {
+                                                        Object consumer = java.lang.reflect.Proxy.newProxyInstance(
+                                                                loader, new Class<?>[] { consumerClass },
+                                                                (proxy, method, args) -> {
+                                                                    if (args != null && args.length == 1) {
+                                                                        patchTodayCalorie(args[0]);
+                                                                    }
+                                                                    return null;
+                                                                });
+                                                        Object wrapped = doOnNext.invoke(observable, consumer);
+                                                        if (wrapped != null) p.setResult(wrapped);
+                                                    }
+                                                }
+                                            } catch (Throwable ignored) { }
+                                        }
                                     } catch (Throwable ignored) { }
                                 }
                             });
                     readHooked = true;
                 } catch (Throwable ignored) { }
             }
+        }
+
+        /**
+         * Rewrites today's calorie on stat rows (table 1002) to the watch value.
+         *
+         * <p>The standalone consumption card opens {@code ConsumptionHistoryActivity}, which reads
+         * table 1002 straight through {@code readSportHealthData} and never touches the sport cache
+         * or any {@code SportDataStat} getter, so neither read-layer override reaches it and the
+         * page shows the host's own total (3083 kcal) instead of the watch's. Patching the emitted
+         * rows fixes every consumer of that read. Past days are left untouched.
+         */
+        private void patchTodayCalorie(Object bean) {
+            try {
+                if (!beanClass.isInstance(bean)) return;
+                if (!Integer.valueOf(0).equals(errorCode.invoke(bean))) return;
+                Object value = payload.invoke(bean);
+                if (!(value instanceof List<?> rows) || rows.isEmpty()) return;
+                int watch = OHealthStepWriter.watchCaloriesNow(OHealthHealthImportHook.appContext);
+                java.time.LocalDate now = java.time.LocalDate.now();
+                int today = now.getYear() * 10_000 + now.getMonthValue() * 100 + now.getDayOfMonth();
+                int matched = 0;
+                int patched = 0;
+                boolean setter = false;
+                StringBuilder names = new StringBuilder();
+                for (Object row : rows) {
+                    if (row == null) continue;
+                    Object dv;
+                    try {
+                        dv = row.getClass().getMethod("getDate").invoke(row);
+                    } catch (Throwable skip) { continue; }
+                    if (!(dv instanceof Integer day) || day != today) continue;
+                    matched++;
+                    // 可能有多个含 calor 的 setter（如 setTotalCalories / setCalorie），
+                    // 页面读的未必是第一个，所以全部改写，不要 break 在首个命中上。
+                    for (java.lang.reflect.Method sm : row.getClass().getMethods()) {
+                        String sn = sm.getName().toLowerCase();
+                        if (!sn.startsWith("set") || !sn.contains("calor")) continue;
+                        // 排除目标类 setter（setCurrentDayCaloriesGoal / setMjkTotalCaloriesGoal /
+                        // setCaloriesGoalComplete 等），它们存的是"目标"不是实际消耗，
+                        // 改了会把 300 千卡的目标毁掉。只改实际消耗 setTotalCalories。
+                        if (sn.contains("goal")) continue;
+                        if (sm.getParameterCount() != 1) continue;
+                        setter = true;
+                        Class<?> pt = sm.getParameterTypes()[0];
+                        if (watch < 0) { names.append(sm.getName()).append('?'); continue; }
+                        if (pt.equals(long.class)) {
+                            sm.invoke(row, (long) watch * 1000L);
+                            patched++;
+                            names.append(sm.getName()).append(',');
+                        } else if (pt.equals(int.class)) {
+                            sm.invoke(row, watch * 1000);
+                            patched++;
+                            names.append(sm.getName()).append(',');
+                        }
+                    }
+                }
+                String line = "HOST_READ_CAL_PATCH rows=" + rows.size() + " todayMatched=" + matched
+                        + " setter=" + setter + " patched=" + patched + " watch=" + watch
+                        + " rowType=" + rows.get(0).getClass().getSimpleName()
+                        + " setters=" + names;
+                HookRuntime.log(line);
+                XposedBridge.log("OplusBandBridge " + line);
+            } catch (Throwable ignored) { }
         }
 
         /** A raw row read. {@code sportMode} is required for tables the library filters by mode. */
