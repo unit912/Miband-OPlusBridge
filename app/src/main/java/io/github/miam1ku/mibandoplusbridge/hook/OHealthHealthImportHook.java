@@ -327,7 +327,7 @@ public final class OHealthHealthImportHook {
                             if (!(result instanceof android.os.Bundle b)) return;
                             String caller = callerOf(new Throwable().getStackTrace());
                             Object shown = b.get("calorie");
-                            int watch = OHealthStepWriter.watchCaloriesToday();
+                            int watch = OHealthStepWriter.watchCaloriesNow(OHealthHealthImportHook.this.context);
                             if (watch >= 0) b.putDouble("calorie", (double) watch);
                             // 2026-10-30: 步数也走读取层覆盖，与 calorie 对称。运动缓存是并发写者
                             // （手机自带计步进程也直写 step），仅在写入层改会被守护进程覆盖回去。
@@ -374,7 +374,7 @@ public final class OHealthHealthImportHook {
                                 }
                                 long result = v;
                                 if (ring) {
-                                    int watch = OHealthStepWriter.watchCaloriesToday();
+                                    int watch = OHealthStepWriter.watchCaloriesNow(OHealthHealthImportHook.this.context);
                                     if (watch >= 0) result = (long) watch * 1000L;
                                 }
                                 String line = "SDS_TOTAL_CALORIES raw=" + v + " /1000=" + (v / 1000)
@@ -414,7 +414,7 @@ public final class OHealthHealthImportHook {
                                 }
                                 int result = v;
                                 if (ring) {
-                                    int watch = OHealthStepWriter.watchCaloriesToday();
+                                    int watch = OHealthStepWriter.watchCaloriesNow(OHealthHealthImportHook.this.context);
                                     if (watch >= 0) result = watch;
                                 }
                                 String line = "BEAN_SET_CALORIE value=" + v + " ring=" + ring
@@ -459,15 +459,35 @@ public final class OHealthHealthImportHook {
                             // real stored value.
                             boolean home = false;
                             for (StackTraceElement s : stack) {
-                                if (s.getClassName().contains("main.viewmodel")) { home = true; break; }
+                                String cn = s.getClassName();
+                                if (cn.contains("main.viewmodel") || cn.contains("daily.model")) {
+                                    home = true;
+                                    break;
+                                }
+                            }
+                            // Only today's row may follow the watch. The daily detail page reuses this
+                            // getter for any date, so without this guard every past day would render
+                            // today's step count.
+                            boolean todayRow = false;
+                            Object self = param.thisObject;
+                            if (self != null) {
+                                try {
+                                    Object d = self.getClass().getMethod("getDate").invoke(self);
+                                    if (d instanceof Integer day) {
+                                        java.time.LocalDate now = java.time.LocalDate.now();
+                                        int today = now.getYear() * 10_000
+                                                + now.getMonthValue() * 100 + now.getDayOfMonth();
+                                        todayRow = day == today;
+                                    }
+                                } catch (Throwable ignored) { }
                             }
                             long result = v;
-                            if (home) {
+                            if (home && todayRow) {
                                 long ws = OHealthStepWriter.watchStepsNow(OHealthHealthImportHook.this.context);
                                 if (ws >= 0) result = ws;
                             }
                             String line = "SDS_TOTAL_STEPS raw=" + v + " home=" + home
-                                    + " final=" + result + " caller=" + callerOf(stack);
+                                    + " today=" + todayRow + " final=" + result + " caller=" + callerOf(stack);
                             HookRuntime.log(line);
                             XposedBridge.log("OplusBandBridge " + line);
                             if (result != v) {

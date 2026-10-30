@@ -56,6 +56,8 @@ final class OHealthStepWriter {
     private static final int INSERT_CHUNK = 400;
     /** Bumped when stored minute keys stop matching what the host holds. */
     static final String CHART_VERSION = "minute-v4";
+    /** Persisted today's watch metric, so the calorie/step override survives a process restart. */
+    static final String LIVE_METRIC_PREFS = "oplusband-live-metric";
     /** InsertOptionCheck rejects the whole batch when one minute is above these. */
     static final int MAX_MINUTE_STEPS = 350;
     static final long MAX_MINUTE_CALORIES = 65_536L;
@@ -521,6 +523,18 @@ final class OHealthStepWriter {
         watchCalories = today.calories >= 0 ? today.calories : -1L;
         watchStepsDate = today.date;
         watchSteps = today.steps >= 0 ? today.steps : -1L;
+        // 2026-10-30: 卡路里/步数同时落盘。上面两个是进程内静态，健康进程冷启后会变成 -1，
+        // 于是详情页（读库原始值，如 3083）拿不到手表口径就直接露出宿主的数，而外卡读的是
+        // 我们写进缓存的值（53）—— 出现"外卡 53、详情 3083"的割裂。落盘后冷启也能取回手表值。
+        try {
+            android.content.SharedPreferences live = context.getSharedPreferences(
+                    LIVE_METRIC_PREFS, android.content.Context.MODE_PRIVATE);
+            live.edit()
+                    .putInt("date", today.date)
+                    .putInt("calorie", (int) (today.calories >= 0 ? today.calories : -1L))
+                    .putLong("step", today.steps >= 0 ? today.steps : -1L)
+                    .apply();
+        } catch (Throwable ignored) { }
         // 2026-10-25: 消耗环口径排查 —— 记录我们写进运动缓存的日总卡路里。
         String putLine = "OHEALTH_PUBLISH_TODAY step=" + today.steps + " calorie=" + today.calories
                 + " distance=" + today.distance + " move=" + today.moveAbout;
@@ -574,6 +588,29 @@ final class OHealthStepWriter {
         LocalDate now = LocalDate.now();
         int today = now.getYear() * 10_000 + now.getMonthValue() * 100 + now.getDayOfMonth();
         return today == watchCaloriesDate ? (int) watchCalories : -1;
+    }
+
+    /**
+     * Today's authoritative watch kilocalories, or -1 — robust against a health-process restart.
+     *
+     * <p>{@link #watchCaloriesToday()} reads a process-local static, which is -1 until the first
+     * step import of the process runs. Every consumer that reads a host-side value (the daily
+     * activity detail repository reads the raw stat, e.g. 3083 kcal) then falls through to the
+     * stored host number and shows it unmodified, while the card reading our own cache shows the
+     * watch value — the "card 53, detail 3083" split. This prefers the static and falls back to
+     * the value {@code publishToday} persisted, so a cold process still answers with the watch.
+     */
+    static int watchCaloriesNow(android.content.Context context) {
+        int live = watchCaloriesToday();
+        if (live >= 0 || context == null) return live;
+        try {
+            android.content.SharedPreferences prefs = context.getSharedPreferences(
+                    LIVE_METRIC_PREFS, android.content.Context.MODE_PRIVATE);
+            LocalDate now = LocalDate.now();
+            int today = now.getYear() * 10_000 + now.getMonthValue() * 100 + now.getDayOfMonth();
+            if (prefs.getInt("date", -1) == today) return prefs.getInt("calorie", -1);
+        } catch (Throwable ignored) { }
+        return -1;
     }
 
     /**
