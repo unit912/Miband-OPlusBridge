@@ -328,7 +328,17 @@ public final class OHealthHealthImportHook {
                             Object shown = b.get("calorie");
                             int watch = OHealthStepWriter.watchCaloriesToday();
                             if (watch >= 0) b.putDouble("calorie", (double) watch);
-                            String line = "CACHE_READ step=" + b.get("step")
+                            // 2026-10-30: 步数也走读取层覆盖，与 calorie 对称。运动缓存是并发写者
+                            // （手机自带计步进程也直写 step），仅在写入层改会被守护进程覆盖回去。
+                            // 这里强制 step=手表当日值，保证首页步数卡永远显示手表口径。
+                            Object stepShown = b.get("step");
+                            long ws = OHealthStepWriter.watchStepsToday();
+                            if (ws >= 0) {
+                                if (stepShown instanceof Integer) b.putInt("step", (int) ws);
+                                else b.putLong("step", ws);
+                            }
+                            String line = "CACHE_READ step=" + stepShown
+                                    + (ws >= 0 ? " -> " + b.get("step") : "")
                                     + " calorie=" + shown + " -> " + b.get("calorie")
                                     + " distance=" + b.get("distance")
                                     + " activityCount=" + b.get("activityCount")

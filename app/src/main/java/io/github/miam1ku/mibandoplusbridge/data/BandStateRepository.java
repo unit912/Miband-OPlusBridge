@@ -245,7 +245,9 @@ public final class BandStateRepository {
             boolean sameDay = previousAt > 0 && LocalDate.ofInstant(Instant.ofEpochMilli(previousAt), ZoneId.systemDefault())
                     .equals(LocalDate.ofInstant(Instant.ofEpochMilli(measuredAtMs), ZoneId.systemDefault()));
             if (measuredAtMs < previousAt && !(authoritative && sameDay)) return;
-            if (!authoritative && sameDay && previous >= stepsToday) return;
+            // 同日不可降护栏已移除：累计日步数只会在手表计步器真实重置时下降（如蓝牙/重配对
+            // 链路重置后），不会瞬时倒退。保留 measuredAtMs<previousAt 这道乱序护栏即可，
+            // 否则重置后本快照基线冻在旧高位，下游（表 1002 / 首页步数环）永远拉不回来。
             long storedAt = authoritative && previousAt > measuredAtMs ? previousAt : measuredAtMs;
             if (previous == stepsToday && storedAt == previousAt) return;
             if (!state.edit().putLong("stepsToday", stepsToday).putLong("stepsAtMs", storedAt)

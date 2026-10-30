@@ -39,6 +39,10 @@ final class OHealthStepWriter {
     private static volatile long watchCalories = -1L;
     /** Local date (yyyymmdd) {@link #watchCalories} belongs to. Stale after midnight. */
     private static volatile int watchCaloriesDate = -1;
+    /** Authoritative watch steps for today, -1 when unknown. Shared with the home card hooks. */
+    private static volatile long watchSteps = -1L;
+    /** Local date (yyyymmdd) {@link #watchSteps} belongs to. Stale after midnight. */
+    private static volatile int watchStepsDate = -1;
     /** SportMode.WALK. A band stores this minute type as-is. A watch remaps it. */
     static final int MINUTE_MODE = 1;
     /** DeviceCategory.BAND. The lowercase value is not a wearable, so the source list keeps only the phone. */
@@ -143,27 +147,69 @@ final class OHealthStepWriter {
             SharedPreferences written) throws Exception {
         String memory = "metric:" + device + ":" + day.date;
         String key = day.steps + ":" + day.calories + ":" + day.moveAbout + ":" + day.distance + ":milli";
-        boolean changed = !key.equals(written.getString(memory, ""));
-        if (changed) {
-            long end = day.startMs + 86_400_000L;
-            List<?> existing = host.readStepDays(api, account, day.startMs, end, DAY_STEP_MODE);
-            if (!covers(existing, device, day, DAY_STEP_MODE)) {
-                host.insertRows(api, TABLE_STAT, List.of(statRow(account, device, day, DAY_STEP_MODE)));
-                List<?> confirmed = host.readStepDays(api, account, day.startMs, end, DAY_STEP_MODE);
-                if (!covers(confirmed, device, day, DAY_STEP_MODE)) {
-                    String miss = "OHEALTH_STEP_STAT_MISS date=" + day.date
-                            + " steps=" + day.steps + " cal=" + (day.calories * (long) CALORIE_SCALE)
-                            + " move=" + day.moveAbout + " " + summarize(confirmed);
-                    HookRuntime.log(miss);
-                    XposedBridge.log("OplusBandBridge " + miss);
-                    throw new IllegalStateException("STEP_STAT_UNCONFIRMED");
-                }
+        long end = day.startMs + 86_400_000L;
+        // Decide against the ACTUAL table value, never against the cached memory. The old code
+        // updated memory even when it skipped the real write (covers()==true but the stored row is
+        // higher than the new authoritative total on a watch counter reset), which poisoned the
+        // skip decision so the reset was never down-written.
+        List<?> existing = host.readStepDays(api, account, day.startMs, end, DAY_STEP_MODE);
+        long stored = existingSteps(existing, device, day, DAY_STEP_MODE);
+        boolean today = isToday(day);
+        boolean needWrite;
+        if (stored < 0) {
+            needWrite = true;                                  // no row yet for this device/date
+        } else if (stored == day.steps) {
+            needWrite = false;                                 // table already correct
+        } else if (today) {
+            // Today only: a watch counter reset leaves stored > day.steps, or a live increase leaves
+            // stored < day.steps. Reconcile (delete + insert) so the day total follows the watch.
+            needWrite = true;
+        } else {
+            // Past/future days: never lower the stored total (it is the authoritative history); only
+            // fill a missing higher value, matching the original behaviour. Prevents a reset on one
+            // day from cascading a down-write across unrelated historical days.
+            needWrite = !covers(existing, device, day, DAY_STEP_MODE);
+        }
+        if (needWrite) {
+            if (today && stored >= 0) {
+                host.deleteRows(api, TABLE_STAT, account, device, day.startMs, end);
             }
-            if (!written.edit().putString(memory, key).commit()) {
-                throw new IllegalStateException("STEP_IMPORT_MEMORY_FAILED");
+            host.insertRows(api, TABLE_STAT, List.of(statRow(account, device, day, DAY_STEP_MODE)));
+            List<?> confirmed = host.readStepDays(api, account, day.startMs, end, DAY_STEP_MODE);
+            if (!covers(confirmed, device, day, DAY_STEP_MODE)) {
+                String miss = "OHEALTH_STEP_STAT_MISS date=" + day.date
+                        + " steps=" + day.steps + " cal=" + (day.calories * (long) CALORIE_SCALE)
+                        + " move=" + day.moveAbout + " " + summarize(confirmed);
+                HookRuntime.log(miss);
+                XposedBridge.log("OplusBandBridge " + miss);
+                throw new IllegalStateException("STEP_STAT_UNCONFIRMED");
+            }
+            if (today && stored > day.steps) {
+                HookRuntime.log("OHEALTH_STEP_STAT_RESET date=" + day.date
+                        + " from=" + stored + " to=" + day.steps);
+                XposedBridge.log("OplusBandBridge OHEALTH_STEP_STAT_RESET date=" + day.date
+                        + " from=" + stored + " to=" + day.steps);
             }
         }
-        return changed;
+        // Always re-sync memory to the real table state so a skipped write cannot poison later runs.
+        if (!written.edit().putString(memory, key).commit()) {
+            throw new IllegalStateException("STEP_IMPORT_MEMORY_FAILED");
+        }
+        return needWrite;
+    }
+
+    private long existingSteps(List<?> rows, String device, BandHistoryParser.StepDay day, int mode)
+            throws ReflectiveOperationException {
+        long found = -1;
+        for (Object row : rows) {
+            if (!statClass.isInstance(row)) continue;
+            if (day.date != (Integer) getDate.invoke(row)) continue;
+            if (!device.equals(getDevice.invoke(row))) continue;
+            if ((Integer) getMode.invoke(row) != mode) continue;
+            long steps = (Integer) getSteps.invoke(row);
+            if (steps > found) found = steps;
+        }
+        return found;
     }
 
     private Object statRow(String account, String device, BandHistoryParser.StepDay day, int mode)
@@ -407,9 +453,15 @@ final class OHealthStepWriter {
         return device + ":" + date + ":n" + minute;
     }
 
-    /** True only when the band total should replace the cached home steps. */
+    /**
+     * True when the band total should replace the cached home steps. The watch is the sole authority
+     * for today's steps (see publishToday), so any valid band value replaces the cache. The old
+     * {@code band > shown} gate froze the home ring at the pre-reset peak on a watch counter reset:
+     * after the reset the live total (707) is lower than the cached value, the gate blocked the write,
+     * and the phone's own step daemon kept accumulating on top.
+     */
     static boolean publishSteps(long shown, long band) {
-        return band > shown && band > 0;
+        return band > 0;
     }
 
     /**
@@ -421,6 +473,12 @@ final class OHealthStepWriter {
         Bundle band = OHealthDeviceHook.registeredSnapshot();
         if (band == null) return;
         long steps = band.getLong("stepsToday", -1);
+        // A snapshot from before midnight is yesterday's total; never let it leak onto a new day's
+        // cache (matches the same-day guard in OHealthLockCardHook.stepToShow).
+        long at = band.getLong("stepsAtMs", 0);
+        long todayStart = java.time.LocalDate.now(java.time.ZoneId.systemDefault())
+                .atStartOfDay(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli();
+        if (at > 0 && at < todayStart) return;
         if (!publishSteps(0, steps)) return;
         ContentValues values = new ContentValues();
         values.put("step", steps);
@@ -436,6 +494,8 @@ final class OHealthStepWriter {
         // 2026-10-26: 环/卡统一口径。手表日总是唯一权威来源，缓存和环都从这里取值。
         watchCaloriesDate = today.date;
         watchCalories = today.calories >= 0 ? today.calories : -1L;
+        watchStepsDate = today.date;
+        watchSteps = today.steps >= 0 ? today.steps : -1L;
         // 2026-10-25: 消耗环口径排查 —— 记录我们写进运动缓存的日总卡路里。
         String putLine = "OHEALTH_PUBLISH_TODAY step=" + today.steps + " calorie=" + today.calories
                 + " distance=" + today.distance + " move=" + today.moveAbout;
@@ -489,6 +549,18 @@ final class OHealthStepWriter {
         LocalDate now = LocalDate.now();
         int today = now.getYear() * 10_000 + now.getMonthValue() * 100 + now.getDayOfMonth();
         return today == watchCaloriesDate ? (int) watchCalories : -1;
+    }
+
+    /**
+     * Today's authoritative watch steps, or -1. The home step card and the daily-activity card read
+     * the same sport cache the phone's own step daemon also writes, so the read path overrides the
+     * value with this instead of writing and then being overwritten (mirrors {@link #watchCaloriesToday}).
+     */
+    static long watchStepsToday() {
+        if (watchStepsDate < 0 || watchSteps < 0) return -1L;
+        LocalDate now = LocalDate.now();
+        int today = now.getYear() * 10_000 + now.getMonthValue() * 100 + now.getDayOfMonth();
+        return today == watchStepsDate ? watchSteps : -1L;
     }
 
     private static boolean isToday(BandHistoryParser.StepDay day) {

@@ -840,7 +840,14 @@ public final class BandHistoryParser {
                 continue;
             }
             seen = true;
-            result.add(new StepDay(day.date, Math.max(day.steps, steps), day.startMs, day.timezone,
+            // Today's entry: the live counter is the freshest reading of today's steps (numeric is
+            // derived from atMs, so this branch only fires when the live reading is from today).
+            // A watch counter reset drops the live value below the saved daily total still held in
+            // history; if we kept Math.max() the home card would freeze at the pre-reset peak forever.
+            // When the live value is lower it is the true current count after a reset, so prefer it
+            // over the stale saved daily total.
+            long chosen = steps;
+            result.add(new StepDay(day.date, chosen, day.startMs, day.timezone,
                     day.calories, day.distance, day.moveAbout));
         }
         if (!seen) result.add(new StepDay(numeric, steps, start, zone.getId(), -1, -1, -1));
