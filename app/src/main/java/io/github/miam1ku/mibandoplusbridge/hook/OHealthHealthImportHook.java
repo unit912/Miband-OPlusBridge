@@ -379,13 +379,30 @@ public final class OHealthHealthImportHook {
                                 for (StackTraceElement s : stack) {
                                     if (s.getClassName().contains("DailyActivity")) { ring = true; break; }
                                 }
+                                // 2026-10-30: 日期保护。DailyActivityDetailRepository 会用它读
+                                // 任意日期（每日活动详情页可翻到往日），只按调用方判定会把往日的
+                                // 消耗也改成"今天的"手表值（全部显示 52）。只有今天那行才跟随手表。
+                                boolean todayRow = false;
+                                Object self = param.thisObject;
+                                if (self != null) {
+                                    try {
+                                        Object dv = self.getClass().getMethod("getDate").invoke(self);
+                                        if (dv instanceof Integer day) {
+                                            java.time.LocalDate now = java.time.LocalDate.now();
+                                            int today = now.getYear() * 10_000
+                                                    + now.getMonthValue() * 100 + now.getDayOfMonth();
+                                            todayRow = day == today;
+                                        }
+                                    } catch (Throwable ignored) { }
+                                }
                                 long result = v;
-                                if (ring) {
+                                if (ring && todayRow) {
                                     int watch = OHealthStepWriter.watchCaloriesNow(OHealthHealthImportHook.this.context);
                                     if (watch >= 0) result = (long) watch * 1000L;
                                 }
                                 String line = "SDS_TOTAL_CALORIES raw=" + v + " /1000=" + (v / 1000)
-                                        + " ring=" + ring + " final=" + result + " caller=" + caller;
+                                        + " ring=" + ring + " today=" + todayRow
+                                        + " final=" + result + " caller=" + caller;
                                 HookRuntime.log(line);
                                 XposedBridge.log("OplusBandBridge " + line);
                                 if (result != v) param.setResult(result);
