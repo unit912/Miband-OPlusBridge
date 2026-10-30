@@ -325,6 +325,7 @@ public final class OHealthHealthImportHook {
                         try {
                             Object result = param.hasThrowable() ? null : param.getResult();
                             if (!(result instanceof android.os.Bundle b)) return;
+                            String caller = callerOf(new Throwable().getStackTrace());
                             Object shown = b.get("calorie");
                             int watch = OHealthStepWriter.watchCaloriesToday();
                             if (watch >= 0) b.putDouble("calorie", (double) watch);
@@ -332,7 +333,7 @@ public final class OHealthHealthImportHook {
                             // （手机自带计步进程也直写 step），仅在写入层改会被守护进程覆盖回去。
                             // 这里强制 step=手表当日值，保证首页步数卡永远显示手表口径。
                             Object stepShown = b.get("step");
-                            long ws = OHealthStepWriter.watchStepsToday();
+                            long ws = OHealthStepWriter.watchStepsNow(OHealthHealthImportHook.this.context);
                             if (ws >= 0) {
                                 if (stepShown instanceof Integer) b.putInt("step", (int) ws);
                                 else b.putLong("step", ws);
@@ -342,7 +343,7 @@ public final class OHealthHealthImportHook {
                                     + " calorie=" + shown + " -> " + b.get("calorie")
                                     + " distance=" + b.get("distance")
                                     + " activityCount=" + b.get("activityCount")
-                                    + " caller=" + callerOf(new Throwable().getStackTrace());
+                                    + " caller=" + caller;
                             HookRuntime.log(line);
                             XposedBridge.log("OplusBandBridge " + line);
                         } catch (Throwable ignored) { }
@@ -430,6 +431,63 @@ public final class OHealthHealthImportHook {
             }
         } catch (Throwable failure) {
             HookRuntime.log("RING_HOOK bean=fail " + failure);
+        }
+        // 2026-10-30: 首页步数卡真正的数据源定位结果。
+        // 首页步数既不是 sport 缓存（querySportData，那里已被我们覆盖成手表值也不是表 1002 统计行
+        // （今日只有手表那一行 1884），而是 StepCardViewModel.fetchTodayDbStep() 读逐分钟明细的
+        // 跨设备求和：手机自身计步(4138) + 我们注入的手表步数(1884) = 6022 —— 典型双重计数。
+        // 与卡路里环同招：hook SportDataStat.getTotalSteps()，仅当调用方是首页步数卡 ViewModel
+        // 时用手表当日值覆盖，历史页/导出等其它消费方仍拿真实存值。
+        try {
+            Class<?> sdsStepClass = Class.forName(
+                    "com.heytap.databaseengine.model.SportDataStat", false, host.loader);
+            for (java.lang.reflect.Method m : sdsStepClass.getMethods()) {
+                if (!m.getName().equals("getTotalSteps") || m.getParameterCount() != 0
+                        || !(m.getReturnType().equals(long.class) || m.getReturnType().equals(int.class))) {
+                    continue;
+                }
+                XposedBridge.hookMethod(m, new XC_MethodHook() {
+                    @Override protected void afterHookedMethod(MethodHookParam param) {
+                        try {
+                            Object raw = param.hasThrowable() ? null : param.getResult();
+                            if (!(raw instanceof Number)) return;
+                            long v = ((Number) raw).longValue();
+                            StackTraceElement[] stack = new Throwable().getStackTrace();
+                            // Only the home page's ViewModels read today's total here (the step card
+                            // and the big step ring both live under com.heytap.health.main.viewmodel).
+                            // Every other consumer (history, export, medals, task cards) keeps the
+                            // real stored value.
+                            boolean home = false;
+                            for (StackTraceElement s : stack) {
+                                if (s.getClassName().contains("main.viewmodel")) { home = true; break; }
+                            }
+                            long result = v;
+                            if (home) {
+                                long ws = OHealthStepWriter.watchStepsNow(OHealthHealthImportHook.this.context);
+                                if (ws >= 0) result = ws;
+                            }
+                            String line = "SDS_TOTAL_STEPS raw=" + v + " home=" + home
+                                    + " final=" + result + " caller=" + callerOf(stack);
+                            HookRuntime.log(line);
+                            XposedBridge.log("OplusBandBridge " + line);
+                            if (result != v) {
+                                // getTotalSteps() declares int here; the home card casts the result
+                                // to Integer, so a Long result throws ClassCastException and kills
+                                // the whole health app. Match the declared return type exactly.
+                                if (m.getReturnType().equals(int.class)) {
+                                    param.setResult((int) result);
+                                } else {
+                                    param.setResult(result);
+                                }
+                            }
+                        } catch (Throwable ignored) { }
+                    }
+                });
+                HookRuntime.log("STEP_CARD_HOOK sds=ok");
+                break;
+            }
+        } catch (Throwable failure) {
+            HookRuntime.log("STEP_CARD_HOOK sds=fail " + failure);
         }
         XposedHelpers.findAndHookMethod(Application.class, "onCreate", new XC_MethodHook() {
             @Override protected void afterHookedMethod(MethodHookParam param) {
@@ -903,6 +961,16 @@ public final class OHealthHealthImportHook {
                 } catch (Exception | LinkageError stepFail) {
                     retrySoon |= transientImport(stepFail);
                     logImportFailure(stepFail);
+                    HookRuntime.log("STEP_WRITE_FAIL " + stepFail + " msg=" + stepFail.getMessage());
+                    XposedBridge.log("OplusBandBridge STEP_WRITE_FAIL " + stepFail
+                            + " msg=" + stepFail.getMessage());
+                    try {
+                        java.io.StringWriter sw = new java.io.StringWriter();
+                        stepFail.printStackTrace(new java.io.PrintWriter(sw));
+                        String trace = sw.toString();
+                        XposedBridge.log("OplusBandBridge STEP_WRITE_TRACE "
+                                + trace.substring(0, Math.min(trace.length(), 1500)));
+                    } catch (Throwable ignored) { }
                 }
             }
             publishCard();

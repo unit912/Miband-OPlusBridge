@@ -112,7 +112,15 @@ final class OHealthStepWriter {
                 BandHistoryParser.stepDays(records), band.getLong("stepsToday", -1),
                 band.getLong("stepsAtMs", 0), java.time.ZoneId.systemDefault()));
         days.removeIf(day -> day.steps <= 0 && day.calories < 0 && day.moveAbout < 0 && day.distance < 0);
-        if (days.isEmpty()) return;
+        if (days.isEmpty()) {
+            // 2026-10-30 诊断：静默 return 是"步数从没写进库"的嫌疑点，无条件打出来。
+            String empty = "STEP_WRITE_EMPTY records=" + (records == null ? -1 : records.size())
+                    + " liveSteps=" + band.getLong("stepsToday", -1)
+                    + " liveAt=" + band.getLong("stepsAtMs", 0);
+            HookRuntime.log(empty);
+            XposedBridge.log("OplusBandBridge " + empty);
+            return;
+        }
         SharedPreferences written = context.getSharedPreferences("oplusband-step-import", Context.MODE_PRIVATE);
         int inserted = 0;
         int skipped = 0;
@@ -153,6 +161,23 @@ final class OHealthStepWriter {
         // higher than the new authoritative total on a watch counter reset), which poisoned the
         // skip decision so the reset was never down-written.
         List<?> existing = host.readStepDays(api, account, day.startMs, end, DAY_STEP_MODE);
+        // 2026-10-30 诊断：dump 今日全部步数统计行（设备/步数/模式/日期），定位首页多出来的
+        // 4138 到底挂在哪个 device 下，以及我们自己的 delete+insert 是否真留单行。
+        if (isToday(day)) {
+            try {
+                StringBuilder dump = new StringBuilder("OHEALTH_STAT_ROWS date=" + day.date
+                        + " mode=" + DAY_STEP_MODE + " mydev=" + device + " rows=");
+                for (Object row : existing) {
+                    if (!statClass.isInstance(row)) continue;
+                    dump.append("[dev=").append(getDevice.invoke(row))
+                            .append(",steps=").append(getSteps.invoke(row))
+                            .append(",mode=").append(getMode.invoke(row))
+                            .append(",date=").append(getDate.invoke(row)).append("]");
+                }
+                HookRuntime.log(dump.toString());
+                XposedBridge.log("OplusBandBridge " + dump);
+            } catch (Throwable ignored) { }
+        }
         long stored = existingSteps(existing, device, day, DAY_STEP_MODE);
         boolean today = isToday(day);
         boolean needWrite;
@@ -561,6 +586,27 @@ final class OHealthStepWriter {
         LocalDate now = LocalDate.now();
         int today = now.getYear() * 10_000 + now.getMonthValue() * 100 + now.getDayOfMonth();
         return today == watchStepsDate ? watchSteps : -1L;
+    }
+
+    /**
+     * Today's authoritative watch steps, read live from the bridge provider (which serves the bridge's
+     * band-state). Falls back to the in-process static {@link #watchStepsToday()} if the provider is
+     * unreachable. Robust against the static being cleared when the health process restarts.
+     */
+    static long watchStepsNow(android.content.Context context) {
+        try {
+            if (context != null) {
+                android.os.Bundle b = context.getContentResolver().call(
+                        android.net.Uri.parse("content://io.github.miam1ku.mibandoplusbridge.health"),
+                        "watchStep", null, null);
+                if (b != null && "WATCH_STEP_OK".equals(b.getString("status"))) {
+                    long steps = b.getLong("steps", -1L);
+                    if (steps >= 0L) return steps;
+                }
+            }
+        } catch (Throwable ignored) { }
+        XposedBridge.log("OplusBandBridge WATCH_STEP_FALLBACK");
+        return watchStepsToday();
     }
 
     private static boolean isToday(BandHistoryParser.StepDay day) {

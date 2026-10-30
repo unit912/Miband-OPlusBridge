@@ -277,6 +277,29 @@ public final class HealthQueueProvider extends ContentProvider {
                 result.putInt("removed", removed);
                 return result;
             }
+            case "watchStep": {
+                // 实机步数权威源：桥接 band-state 持久化的当日手表步数。读取层用它跨进程实时取数，
+                // 不依赖健康进程内会被清零的静态字段 —— 否则健康进程冷启后到下次导入才刷新，首页会
+                // 短暂显示手机守护进程（SportDaemonService）写回的步数。
+                io.github.miam1ku.mibandoplusbridge.data.LocalPrefs sp =
+                        io.github.miam1ku.mibandoplusbridge.data.LocalPrefs.open(getContext(), "band-state");
+                long steps = sp.getLong("stepsToday", -1);
+                long atMs = sp.getLong("stepsAtMs", 0);
+                android.os.Bundle result = new android.os.Bundle();
+                result.putLong("steps", steps);
+                result.putLong("atMs", atMs);
+                if (steps >= 0 && atMs > 0) {
+                    java.time.LocalDate day = java.time.LocalDate.ofInstant(
+                            java.time.Instant.ofEpochMilli(atMs), java.time.ZoneId.systemDefault());
+                    boolean today = day.equals(java.time.LocalDate.now(java.time.ZoneId.systemDefault()));
+                    result.putBoolean("today", today);
+                    result.putString("status", today ? "WATCH_STEP_OK" : "WATCH_STEP_OTHER_DAY");
+                } else {
+                    result.putBoolean("today", false);
+                    result.putString("status", "WATCH_STEP_MISSING");
+                }
+                return result;
+            }
             default:
                 throw new IllegalArgumentException("UNSUPPORTED_HEALTH_OPERATION");
         }
