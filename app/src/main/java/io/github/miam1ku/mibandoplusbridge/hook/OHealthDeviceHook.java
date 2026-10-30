@@ -190,7 +190,9 @@ public final class OHealthDeviceHook {
             Bundle shown = snapshot;
             String mac = shown == null ? "" : shown.getString("mac", "");
             if (mac == null || mac.isBlank()) return;
-            String md5 = md5Lowercase(mac.toLowerCase(java.util.Locale.ROOT));
+            // 规范主键 = 大写冒号 MAC 的 MD5（与健康/欢太卡 device_id 一致）；
+            // 同时保留小写 MD5 作为兼容比对，确保两种形态的主键都能命中并改写图标。
+            String md5 = md5Lowercase(normalizedMac(mac));
             int hit = -1;
             for (int pos = 0; cursor.moveToPosition(pos); pos++) {
                 String data = cursor.getString(dataIdx);
@@ -1315,6 +1317,20 @@ public final class OHealthDeviceHook {
         } catch (java.security.NoSuchAlgorithmException impossible) {
             return text;
         }
+    }
+
+    /** 与 DeviceCardProvider.normalizeMac 一致：MAC 归一化为「大写 + 冒号」规范串；非法返回原串。 */
+    private static String normalizedMac(String mac) {
+        if (mac == null) return mac;
+        String s = mac.trim().toUpperCase(java.util.Locale.ROOT)
+                .replace(":", "").replace("-", "").replace(".", "");
+        if (s.length() != 12) return mac;
+        StringBuilder out = new StringBuilder(17);
+        for (int i = 0; i < 12; i++) {
+            if (i != 0 && i % 2 == 0) out.append(':');
+            out.append(s.charAt(i));
+        }
+        return out.toString();
     }
 
     /** Health's card for this band. The bridge card lives in another process, so this lookup only sees Health's row. */

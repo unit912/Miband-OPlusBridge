@@ -90,23 +90,28 @@ public final class DeviceCardProvider extends ContentProvider {
         if (!state.getBoolean("registered", false)) return result;
         // When Health already placed this band in device space, the bridge row stays out.
         if (spaceYielded()) return result;
-        String deviceId = state.getString("deviceId", "");
-        if (deviceId == null || deviceId.isBlank()) return result;
+        String internalId = state.getString("deviceId", "");
+        if (internalId == null || internalId.isBlank()) return result;
         String mac = state.getString("mac", "");
+        if (mac == null || mac.isBlank()) return result;
+        // 对外 device_id 改用 MAC 的 MD5：与欢太账号登记的 GT3 卡（device_id 同为 MD5(MAC)）
+        // 共用同一主键，mydevices 按 device_id upsert 覆盖而合一 —— 设备空间不再出现第二块手表。
+        // 内部主键（huaweigt3_ 指纹）仍保留在 band-state，供健康数据归档等内部逻辑关联，不外泄。
+        String cardId = bridgeCardId(mac);
         if (key != null) {
             String actual = switch (key) {
-                case "device_id" -> deviceId;
+                case "device_id" -> cardId;
                 case "device_mac" -> mac;
                 default -> AUTHORITY;
             };
             if (!actual.equals(selectionArgs[0])) return result;
         }
         try {
-            JSONObject data = deviceData(state, deviceId, mac);
+            JSONObject data = deviceData(state, cardId, mac);
             MatrixCursor.RowBuilder row = result.newRow();
             for (String column : requested) {
                 row.add(switch (column) {
-                    case "device_id" -> deviceId;
+                    case "device_id" -> cardId;
                     case "device_mac" -> mac;
                     case "device_data" -> data.toString();
                     default -> AUTHORITY;
@@ -174,6 +179,47 @@ public final class DeviceCardProvider extends ContentProvider {
         } catch (RuntimeException ignored) {
             return false;
         }
+    }
+
+    /**
+     * 设备空间卡片对外主键：MAC 的 MD5 小写 hex。
+     *
+     * <p>欢太账号登记的 GT3 卡主键 = {@code MD5(MAC)}，而 MAC 取蓝牙栈上报的
+     * 规范形式（大写 + 冒号分隔，如 {@code "54:52:84:9F:D1:3D"}）。已实测本机
+     * {@code MD5("54:52:84:9F:D1:3D") = defa361518d5bdd0f83cf67ce371f26e}，
+     * 与设备空间里欢太卡的 {@code device_id} 逐字符一致。
+     *
+     * <p>桥接必须算出<b>同一个</b> 主键，mydevices 才按 {@code device_id} upsert
+     * 覆盖、把两张卡合一。若直接对 band-state 里的大小写/分隔变体取哈希就会得到
+     * 另一个值（例如小写冒号形式 = 7d73e037…，主键不一致 → 又变双卡）。因此这里
+     * 先把 MAC 归一化成「大写 + 冒号」规范串再哈希，确保与欢太卡同键。
+     */
+    private static String bridgeCardId(String mac) {
+        if (mac == null || mac.isBlank()) return "";
+        String normalized = normalizeMac(mac);
+        if (normalized == null) return "";
+        try {
+            byte[] digest = java.security.MessageDigest.getInstance("MD5")
+                    .digest(normalized.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            StringBuilder hex = new StringBuilder(32);
+            for (byte b : digest) hex.append(String.format("%02x", b));
+            return hex.toString();
+        } catch (java.security.NoSuchAlgorithmException impossible) {
+            return "";
+        }
+    }
+
+    /** 把任意大小写 / 分隔（`-`、`.`、无分隔）的 MAC 归一化为「大写 + 冒号」规范串；非法返回 null。 */
+    private static String normalizeMac(String mac) {
+        String s = mac.trim().toUpperCase(java.util.Locale.ROOT)
+                .replace(":", "").replace("-", "").replace(".", "");
+        if (s.length() != 12) return null;
+        StringBuilder out = new StringBuilder(17);
+        for (int i = 0; i < 12; i++) {
+            if (i != 0 && i % 2 == 0) out.append(':');
+            out.append(s.charAt(i));
+        }
+        return out.toString();
     }
 
     private static String spaceIcon(io.github.miam1ku.mibandoplusbridge.data.LocalPrefs state) {

@@ -309,18 +309,32 @@ public final class MyDevicesHook {
         HookRuntime.log("ICON_PACKAGE_HOOK " + found.getName());
     }
 
+    private static String safeCall(Object target, String method) {
+        try {
+            return String.valueOf(XposedHelpers.callMethod(target, method));
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
     private static boolean ourBand(Object device) {
         if (device == null) return false;
-        for (String name : new String[]{"getDeviceAppPackage", "getPackageName"}) {
-            try {
-                if (PACKAGE.equals(String.valueOf(XposedHelpers.callMethod(device, name)))) return true;
-            } catch (Throwable ignored) { }
+        String pkg = safeCall(device, "getDeviceAppPackage");
+        if (pkg == null) pkg = safeCall(device, "getPackageName");
+        if (PACKAGE.equals(pkg)) {
+            // 合一后设备空间卡片 device_id 为 MAC 的 MD5，记下本机桥接卡主键供 bandDevice 识别
+            String id = safeCall(device, "getMyDeviceId");
+            if (id == null) id = safeCall(device, "getDeviceId");
+            if (id == null) id = safeCall(device, "getId");
+            if (id != null && id.length() == 32) NativePanel.BRIDGE_CARD_ID = id;
+            return true;
         }
-        for (String name : new String[]{"getMyDeviceId", "getDeviceId", "getId"}) {
-            try {
-                String id = String.valueOf(XposedHelpers.callMethod(device, name));
-                if (id.startsWith("miband11_")) return true;
-            } catch (Throwable ignored) { }
+        String id = safeCall(device, "getMyDeviceId");
+        if (id == null) id = safeCall(device, "getDeviceId");
+        if (id == null) id = safeCall(device, "getId");
+        if (id != null) {
+            if (id.startsWith("miband11_")) return true;
+            if (NativePanel.BRIDGE_CARD_ID != null && id.equals(NativePanel.BRIDGE_CARD_ID)) return true;
         }
         return false;
     }
@@ -492,7 +506,28 @@ public final class MyDevicesHook {
                     Object remembered = HookRuntime.carried(CARRIED_CARD);
                     if (remembered instanceof String id && !id.isBlank()) before = new Snapshot(id, Long.MIN_VALUE);
                 }
-                if (now == null && before == null) before = published();
+                if (before == null) {
+                    Snapshot internal = published();
+                    if (now == null) {
+                        before = internal;
+                    } else {
+                        // 合一后首刷：provider 已返回规范主键（大写冒号 MAC 的 MD5，与欢太卡同键）。
+                        // 清理一切旧版遗留行，防止双卡复发：
+                        //  ① 内部主键 huaweigt3_（v196 之前的版本）
+                        //  ② 小写 MD5 错键（v196 误用 mac.toLowerCase() 那版，主键与健康卡不一致）
+                        // CARRIED_CARD 在历史版本间会携带旧主键，热重载可正常清理；此处兜底——
+                        // 即使 CARRIED_CARD 因进程重启丢失，也能把两条遗留行清掉。
+                        if (internal != null && !internal.id().equals(now.id()) && !internal.id().equals(withdrawn)) {
+                            removed.invoke(observer, internal.id(), false, PACKAGE);
+                            withdrawn = internal.id();
+                        }
+                        String legacy = legacyWrongId(context);
+                        if (legacy != null && !legacy.equals(now.id()) && !legacy.equals(withdrawn)) {
+                            removed.invoke(observer, legacy, false, PACKAGE);
+                            withdrawn = legacy;
+                        }
+                    }
+                }
                 if (before != null && (now == null || !before.id().equals(now.id()))
                         && !before.id().equals(withdrawn)) {
                     removed.invoke(observer, before.id(), false, PACKAGE);
@@ -537,6 +572,29 @@ public final class MyDevicesHook {
             } catch (RuntimeException unavailable) {
                 return null;
             }
+        }
+    }
+
+    /**
+     * 旧版（v196）误用 {@code mac.toLowerCase()} 算出的错键：小写冒号 MAC 的 MD5。
+     * 主键与健康/欢太卡（大写冒号 MAC 的 MD5）不一致，曾导致设备空间多出第二块手表。
+     * 合一后该键永远是遗留行，必须被 {@code removed} 清理。
+     */
+    private static String legacyWrongId(Context context) {
+        try {
+            android.os.Bundle display = context.getContentResolver().call(
+                    DeviceCardProvider.URI, "bandDisplay", null, null);
+            if (display == null || !display.getBoolean("registered", false)) return null;
+            String mac = display.getString("mac", "");
+            if (mac == null || mac.isBlank()) return null;
+            String s = mac.trim().toLowerCase(java.util.Locale.ROOT);
+            byte[] digest = java.security.MessageDigest.getInstance("MD5")
+                    .digest(s.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            StringBuilder hex = new StringBuilder(32);
+            for (byte b : digest) hex.append(String.format("%02x", b));
+            return hex.toString();
+        } catch (Throwable ignored) {
+            return null;
         }
     }
 }
