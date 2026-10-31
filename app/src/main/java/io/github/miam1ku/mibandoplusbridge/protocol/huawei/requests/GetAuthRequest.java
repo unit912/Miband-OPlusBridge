@@ -37,7 +37,7 @@ public class GetAuthRequest extends Request {
     private final byte authAlgo;
     /** 服务端 nonce ‖ 客户端 nonce，作为 HMAC 的消息体。 */
     private final byte[] doubleNonce;
-    /** HMAC 密钥。由 PIN 或已有 secretKey 派生，为 {@code null} 时走 HiChainLite 简化算法。 */
+    /** HMAC 密钥。来自设备 secretKey（MAC 派生，Lite 路径必然非 null）。 */
     private byte[] key;
     private final HuaweiCrypto huaweiCrypto;
 
@@ -63,10 +63,13 @@ public class GetAuthRequest extends Request {
     protected List<byte[]> createRequest() throws RequestCreationException {
         try {
             if (paramsProvider.getAuthMode() == 0x02) {
-                key = paramsProvider.getPinCode();
-                if (authVersion == 0x02) {
-                    key = paramsProvider.getSecretKey();
-                }
+                // HiChain Lite / Normal 路径用设备 secretKey（MAC 派生，startHiChainLite
+                // 已保证非 null）做 HMAC，不再取 PIN —— Lite 分支从未发起 GetPincodeRequest，
+                // 取 PIN 会得到 null，进而 digestResponse(null,…) 返回 null →
+                // ByteBuffer.wrap(null) 抛 "Attempt to get length of null array"。
+                // Watch 3（authType=0x1 / authVersion=1）即踩中此雷；GT3 走完整 HiChain
+                // PAKE，不经过这里，本改动对其无任何影响。
+                key = paramsProvider.getSecretKey();
             }
 
             byte[] nonce = ByteBuffer.allocate(18)

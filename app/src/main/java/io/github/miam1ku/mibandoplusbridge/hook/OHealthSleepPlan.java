@@ -43,11 +43,23 @@ public final class OHealthSleepPlan {
 
     private OHealthSleepPlan() {}
 
-    /** The calendar date whose 20:00-to-20:00 window contains this wake time. */
-    public static int sleepDate(long endMs, ZoneId zone) {
+    /**
+     * The calendar date whose 20:00-to-20:00 window contains this wake time.
+     * Defensive clamp: if the computed date is later than today's local date — a wake ≥20:00
+     * fragment, or a watch/phone timezone mismatch pushing the local hour past 20:00 — fall
+     * back to the fall-asleep local day so the home card never displays a future date.
+     */
+    public static int sleepDate(long endMs, long fallMs, ZoneId zone) {
         var local = Instant.ofEpochMilli(endMs).atZone(zone).toLocalDateTime();
         LocalDate day = local.getHour() >= 20 ? local.toLocalDate().plusDays(1) : local.toLocalDate();
-        return day.getYear() * 10000 + day.getMonthValue() * 100 + day.getDayOfMonth();
+        int date = day.getYear() * 10000 + day.getMonthValue() * 100 + day.getDayOfMonth();
+        LocalDate today = LocalDate.now(zone);
+        int todayDate = today.getYear() * 10000 + today.getMonthValue() * 100 + today.getDayOfMonth();
+        if (date > todayDate) {
+            LocalDate fallDay = Instant.ofEpochMilli(fallMs).atZone(zone).toLocalDateTime().toLocalDate();
+            date = fallDay.getYear() * 10000 + fallDay.getMonthValue() * 100 + fallDay.getDayOfMonth();
+        }
+        return date;
     }
 
     /**
@@ -121,7 +133,7 @@ public final class OHealthSleepPlan {
             for (List<Segment> cluster : clusters) {
                 long fall = cluster.get(0).startMs();
                 long wake = cluster.get(cluster.size() - 1).endMs();
-                int date = sleepDate(wake, zone);
+                int date = sleepDate(wake, fall, zone);
                 Count counted = count(cluster);
                 sessions.add(new Session(date, zone, fall, wake,
                         counted.sleep, counted.deep, counted.light, counted.rem, counted.awake, cluster));
