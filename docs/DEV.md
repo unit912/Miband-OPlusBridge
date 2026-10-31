@@ -66,6 +66,13 @@ work/
 - `adb logcat -d` 卡死用 `-t N`。健康 DB 加密(SQLCipher) 则走 hook 回读。
 - 关键日志点：`SDS_TOTAL_STEPS`(步数覆盖) / `HOST_READ_CAL_PATCH`(卡路里读层补) / `OHEALTH_SLEEP_BEGIN`+`OHEALTH_SLEEP_DAY_*`(睡眠分日) / `MODULE`(注入)。
 
-## 10. 上游策略
-- 只 cherry-pick 需要的上游 commit（如 `b1a53f9`/`bb9df8e`），**不 merge 上游 main**（会带入与 GT3 无关的 UI 重构等 23 个提交）。
-- 远程开发分支用 `dev/h2o`（纯本地开发线），不要推 `origin/main`（混着上游线，会 non-fast-forward 拒绝）。
+## 10. 远程与上游策略（fork 工作流）
+- **账号关系**：`MiaM1ku` = 原作者（小米版，仓库在他名下）；`unit912` = 本开发分支 owner（华为分支）。
+- **remote 配置**（每台新设备 clone 后需重配，不随仓库走）：
+  - `origin` = `git@github.com:unit912/Miband-OPlusBridge.git`（你的 fork，开发 + push 目标）
+  - `upstream` = `git@github.com:MiaM1ku/Miband-OPlusBridge.git`（原作者，仅 fetch 同步，不 push）
+  - 配法：`git remote set-url origin git@github.com:unit912/Miband-OPlusBridge.git; git remote add upstream git@github.com:MiaM1ku/Miband-OPlusBridge.git`
+- **开发分支**：所有华为分支提交汇到 `dev/h2o`（纯本地开发线），**不要推 `origin/main`**（混着上游线，会 non-fast-forward 拒绝）。
+- **同步原作者更新**：`git fetch upstream` → 按需 `git cherry-pick <upstream commit>`（如 `b1a53f9`/`bb9df8e`），**不 merge upstream/main**（会带入与 GT3 无关的小米 UI 重构等提交）。
+- **tags**：`snapshot/vNNN` 用 `git push origin --tags` 上云；新设备 `git fetch --tags` 获取。
+- **SSH**：每台设备生成自己的 ed25519 key 加进 `unit912` 账号（Settings → SSH and GPG keys）。
