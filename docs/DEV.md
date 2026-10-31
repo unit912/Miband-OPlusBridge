@@ -76,3 +76,11 @@ work/
 - **同步原作者更新**：`git fetch upstream` → 按需 `git cherry-pick <upstream commit>`（如 `b1a53f9`/`bb9df8e`），**不 merge upstream/main**（会带入与 GT3 无关的小米 UI 重构等提交）。
 - **tags**：`snapshot/vNNN` 用 `git push origin --tags` 上云；新设备 `git fetch --tags` 获取。
 - **SSH**：每台设备生成自己的 ed25519 key 加进 `unit912` 账号（Settings → SSH and GPG keys）。
+
+## 11. 项目记忆的 git 镜像与恢复（双保险）
+- 本仓库 `docs/MEMORY.md` 是 WorkBuddy 本地记忆 `.workbuddy/memory/MEMORY.md` 的 **git 托管镜像**（含版本决策表 + 6 条护栏）。`docs/DEV.md` 偏开发流程，`docs/MEMORY.md` 偏记忆/决策/方法。
+- **恢复步骤**（新设备 clone 后，让 WorkBuddy 新会话自动加载经验）：
+  1. `git clone git@github.com:unit912/Miband-OPlusBridge.git` → `git checkout dev/h2o`
+  2. 把 `docs/MEMORY.md` **整文件复制**到工作区 `.workbuddy/memory/MEMORY.md`（覆盖或新建均可）
+  3. 重启/新建 WorkBuddy 会话 → 记忆自动注入
+- 注意：`.workbuddy/memory/` 不在 git 内，逐日排查日志(`YYYY-MM-DD.md`)需随工作区整体搬运（见换机方案 A）或从会话历史重建。
