@@ -19,6 +19,9 @@ work/
 scripts/_javac_out/
 *.log
 
+# 例外：debug 签名密钥体积小、密码公开(android)，随仓库走，换设备 clone 即可构建
+!work/toolchain/keystore/debug.keystore
+
 # 调屏时的临时产物（仓库根目录散落的截图与布局快照）
 /detail*.xml
 /detail*.png
